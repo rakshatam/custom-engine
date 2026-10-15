@@ -273,9 +273,5 @@ Run `python ocean_capture_runner.py --sequence` to build and validate the 12-fra
 
 Interaction terms modify analytic shading height and normals on a flat DXR intersection quad. They improve visible contact, glints, foam and wakes without per-frame BLAS rebuilding, but do not change the ray-hit silhouette, hide submerged geometry as a real displaced surface would, or provide full two-way fluid pressure. Run `python reflection_capture_runner.py --scene sponza --native-resolution` to capture DXR reflections on, off, and restored at exactly 1920x1080, then compare the resulting BMPs in `captures/`.
 
-### Latest verification snapshot — 2026-10-16
 
-The latest repeated-bounce water sequence run (`python ocean_capture_runner.py --sequence`) generated 12 frames at 688×448, with 6 detected entries by frame 90 and 10 by frame 180. Of 89,561 pixels classified as water in both frames 90 and 180, 87.6% changed by more than five channel levels and the mean channel delta was 35.59. The run measured 419.188 FPS; an immediate repeat measured 426.752 FPS, so these short local timings vary with GPU scheduling. `docs/media/water-bounce-30fps.gif` is encoded from 166 dense simulation captures at 516×336, averaging 30.02 FPS, and has a size of 11.3 MB. The DXR water proxy is still flat, so contact, radial rings, foam, and motion wakes are shader-side analytic effects rather than geometric displacement.
-
-After the final capture-mode build, the dense ocean capture passed with all 166 frames. The ocean reflection toggle passed (1.247 mean channel delta, 4.75% changed pixels). The full Sponza capture runner passed 8/8 captures at 960×544 (265.69 FPS direct + shadows and 48.0546 FPS GI). The latest exact 1920×1080 Sponza reflection toggle passed with 0.544 mean channel delta and 48.50% changed pixels (129.59/128.53 FPS on/off). `ctest --test-dir build -C Release --output-on-failure` and all Python runner syntax checks passed.
 
