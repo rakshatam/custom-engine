@@ -27,7 +27,7 @@ The renderer favors a fast direct-lighting mode for interaction and provides a s
 
 <img width="1907" height="1011" alt="Screenshot 2026-10-18 181634" src="https://github.com/user-attachments/assets/641ac5f7-64fd-4953-96b9-2112e9b18981" />
 <img width="1907" height="1011" alt="Screenshot 2026-10-18 182159" src="https://github.com/user-attachments/assets/d8ac3306-370f-4c17-b044-8332b51953a4" />
-<img width="1905" height="1016" alt="sponza-rt-reflections" src="https://github.com/user-attachments/assets/6db83968-c940-4629-aa4a-e5a52080714a" />
+
 
 
 The latest water preview is captured from the 60 Hz Jolt simulation at 30 frames per second. The DXR quad remains flat broad-phase geometry, while the closest-hit shader corrects the primary ray position and depth against the analytic water height field. On the ocean, the reflection toggle traces a single scene-geometry ray from the wave-corrected water hit and blends the returned object/environment radiance with dielectric Fresnel; when disabled, the analytic-sky reflection remains as the fallback.
