@@ -25,7 +25,8 @@ The renderer favors a fast direct-lighting mode for interaction and provides a s
 
 The first two screenshots are user-provided editor captures. The path-traced image shows 1920×1080 with 341 accumulated samples; the DXR-reflection image shows the reflections toggle enabled at 1920×1080. The displayed FPS is the editor overlay at capture time, not a repeatable benchmark result.
 
-![Sponza path tracing at 1920x1080; editor overlay reports 9.3 FPS and 341 accumulated samples](docs/media/sponza-path-traced-1080p.png)
+![Sponza path tracing at 1920x1080; editor overlay reports 9.3 FPS and 341 accumulated samples<img width="1907" height="1011" alt="Screenshot 2026-10-18 181634" src="https://github.com/user-attachments/assets/641ac5f7-64fd-4953-96b9-2112e9b18981" />
+
 
 ![Sponza direct rendering with DXR specular reflections enabled at 1920x1080; editor overlay reports 91.3 FPS](docs/media/sponza-rt-reflections.png)
 
