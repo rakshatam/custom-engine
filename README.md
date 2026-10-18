@@ -26,6 +26,7 @@ The renderer favors a fast direct-lighting mode for interaction and provides a s
 
 
 <img width="1907" height="1011" alt="Screenshot 2026-10-18 181634" src="https://github.com/user-attachments/assets/641ac5f7-64fd-4953-96b9-2112e9b18981" />
+<img width="1907" height="1011" alt="Screenshot 2026-10-18 182159" src="https://github.com/user-attachments/assets/d8ac3306-370f-4c17-b044-8332b51953a4" />
 
 
 (docs/media/sponza-rt-reflections.png)
