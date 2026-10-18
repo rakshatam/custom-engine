@@ -5,6 +5,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <algorithm>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -36,6 +37,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                              L"WaterDemo.exe", -1, TRUE) == CSTR_EQUAL;
     const bool waterDemoMode = launchedAsWaterDemo || fullCmdLine.find("--water-demo") != std::string::npos;
     bool oceanTestMode = fullCmdLine.find("--ocean-test") != std::string::npos;
+    bool oceanNoBodyDisplacement = fullCmdLine.find("--ocean-no-body-displacement") != std::string::npos;
     bool oceanGif30FpsMode = fullCmdLine.find("--ocean-gif-30fps") != std::string::npos;
     bool oceanSequenceMode = fullCmdLine.find("--ocean-sequence") != std::string::npos || oceanGif30FpsMode;
     bool reflectionCompareMode = fullCmdLine.find("--reflection-compare") != std::string::npos;
@@ -101,6 +103,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         oceanSceneInitialized = true;
         activeScene = &oceanScene;
         if (oceanTestMode && fullCmdLine.find("--ocean-no-reflections") != std::string::npos) oceanScene.getSceneCB().enableRayTracedReflections = 0.0f;
+        if (oceanTestMode && oceanNoBodyDisplacement) {
+            logFile << "[Ocean Test] GPU body displacement field disabled for comparison." << std::endl;
+        }
         logFile << (oceanTestMode ? "[Ocean Test]" : "[Water Demo]")
                 << " Initialized interactive ocean scene with Jolt bodies="
                 << oceanScene.getTotalInstances() - 1 << std::endl;
@@ -158,7 +163,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         float dt = oceanTestMode ? (1.0f / 60.0f) : wallDt;
 
         if (window.isResized()) {
-            device.resize(window.getWidth(), window.getHeight());
+            if (!device.resize(window.getWidth(), window.getHeight())) {
+                logFile << "[DXGI Error] Could not restore valid swap-chain targets after resize; shutting down safely.\n";
+                return -1;
+            }
             window.clearResized();
         }
 
@@ -200,6 +208,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         << ", simulated=" << scene.getOceanSimulationTime() << " seconds, max body Y displacement="
                         << scene.getOceanMaxVerticalDisplacement() << " m, final body Y range=" << scene.getOceanMinBodyY()
                         << ".." << scene.getOceanMaxBodyY() << " m, impacts=" << scene.getOceanImpactCount()
+                        << ", water entries/exits=" << scene.getOceanEntryCrossingCount() << "/"
+                        << scene.getOceanExitCrossingCount()
                         << ", average=" << averageMs << " ms ("
                         << (averageMs > 0.0 ? 1000.0 / averageMs : 0.0) << " FPS)" << std::endl;
                 needCapture = 8;
@@ -223,11 +233,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         } else if (reflectionCompareMode) {
             frameNum++;
-            if (frameNum == 31) {
+            if (frameNum == 65) {
                 scene.getSceneCB().enableRayTracedReflections = 0.0f;
                 scene.resetAccumulation();
                 logFile << "[Reflection Test] Disabled DXR reflections for the off capture.\n";
-            } else if (frameNum == 56) {
+            } else if (frameNum == 129) {
                 scene.getSceneCB().enableRayTracedReflections = 1.0f;
                 scene.resetAccumulation();
                 logFile << "[Reflection Test] Restored DXR reflections for the final capture.\n";
@@ -235,13 +245,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             if (frameNum >= 10 && frameNum <= 29) {
                 directModeFrameTimeSum += dt;
                 ++directModeFrameCount;
-            } else if (frameNum >= 36 && frameNum <= 55) {
+            } else if (frameNum >= 70 && frameNum <= 127) {
                 giFrameTimeSum += dt;
                 ++giFrameTimeCount;
             }
-            if (frameNum == 30) needCapture = 9;
-            else if (frameNum == 55) needCapture = 10;
-            else if (frameNum == 80) needCapture = 11;
+            if (frameNum == 64) needCapture = 9;
+            else if (frameNum == 128) needCapture = 10;
+            else if (frameNum == 192) needCapture = 11;
         } else if (testMode) {
             frameNum++;
             if (frameNum == 20) {
@@ -338,18 +348,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
 
         if (editorUI.hasResolutionChanged()) {
-            pipeline.resizeOutput(device, editorUI.getTargetRenderWidth(), editorUI.getTargetRenderHeight());
+            if (!pipeline.resizeOutput(device, editorUI.getTargetRenderWidth(), editorUI.getTargetRenderHeight())) {
+                logFile << "[DXR Error] Output resize failed; previous render resources and resolution remain active.\n";
+            }
             scene.resetAccumulation();
             editorUI.clearResolutionChanged();
         }
 
         float renderAspect = static_cast<float>(pipeline.getRenderWidth()) / static_cast<float>(pipeline.getRenderHeight());
-        scene.update(dt, window, editorUI.getViewportX(), editorUI.getViewportY(), editorUI.getViewportW(), editorUI.getViewportH(), renderAspect, pipeline.getRenderHeight());
+        scene.update(dt, window, editorUI.getViewportX(), editorUI.getViewportY(), editorUI.getViewportW(),
+                     editorUI.getViewportH(), renderAspect, pipeline.getRenderHeight(), device.getFrameIndex());
+        if (oceanTestMode && oceanNoBodyDisplacement && scene.isOceanScene()) {
+            SceneCB& oceanConstants = scene.getSceneCB();
+            const uint32_t bodyCount = std::min(oceanConstants.oceanBodyCount, 8u);
+            for (uint32_t bodyIndex = 0; bodyIndex < bodyCount; ++bodyIndex) {
+                oceanConstants.oceanBodyVerticalState[bodyIndex].z = 0.0f;
+            }
+        }
         if (oceanSequenceCaptureFrame != 0) {
             logFile << "[Ocean Sequence] Frame " << oceanSequenceCaptureFrame
                     << ": simulated=" << scene.getOceanSimulationTime() << " seconds, impacts="
-                    << scene.getOceanImpactCount() << ", bodyY=" << scene.getOceanMinBodyY()
-                    << ".." << scene.getOceanMaxBodyY() << " m" << std::endl;
+                    << scene.getOceanImpactCount() << ", crossings=" << scene.getOceanEntryCrossingCount()
+                    << "/" << scene.getOceanExitCrossingCount() << ", bodyY=" << scene.getOceanMinBodyY()
+                    << ".." << scene.getOceanMaxBodyY() << " m, bodyYs=";
+            for (uint32_t bodyIndex = 0; bodyIndex < scene.getPhysicsBodyCount(); ++bodyIndex) {
+                if (bodyIndex != 0) logFile << ',';
+                logFile << scene.getOceanBodyY(bodyIndex);
+            }
+            logFile << std::endl;
         }
         if (!pipeline.isNrdAvailable()) scene.getSceneCB().enableNRD = 0;
 
@@ -382,6 +408,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             logFile << "[DXR] DispatchRays recorded for " << pipeline.getRenderWidth() << 'x'
                     << pipeline.getRenderHeight() << " render target." << std::endl;
             dxrDispatchLogged = true;
+        }
+
+        if (reflectionCompareMode && needCapture >= 9 && needCapture <= 11) {
+            logFile << "[Reflection Test] Capture " << needCapture << " sample=" << scene.getSceneCB().frameCount
+                    << " accumulation=" << scene.getSceneCB().accumFrameCount << ".\n";
         }
 
         if ((needCapture >= 1 && needCapture <= 5) || needCapture == 7 || needCapture == 8 ||

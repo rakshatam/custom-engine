@@ -8,6 +8,7 @@
 #include <Jolt/Physics/Body/BodyInterface.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
+#include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include "../src/ecs/OceanWave.h"
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayer.h>
 #include <cstdint>
@@ -63,6 +64,11 @@ public:
 struct FloatBody {
     JPH::BodyID id;
     float buoyancy = 1.90f;
+    float halfX = 0.5f;
+    float halfY = 0.5f;
+    float halfZ = 0.5f;
+    float waterRadius = 0.5f;
+    bool ellipsoid = false;
 };
 
 struct WaterImpact {
@@ -86,30 +92,53 @@ struct World {
     World() {
         physics.Init(256, 0, 2048, 1024, broadPhase, objectVsBroadPhase, objectPairs);
         physics.SetGravity(JPH::Vec3(0.0f, -9.81f, 0.0f));
+        floats.reserve(256);
+        waterImpacts.reserve(256);
     }
 };
 
 bool g_joltInitialized = false;
+uint32_t g_worldCount = 0;
 
 Engine::OceanWaveSample sampleWaterSurface(const World& world, float x, float z, float t, int32_t excludedBody) {
     Engine::OceanWaveSample wave = Engine::evaluateOceanWave(x, z, t);
     for (const WaterImpact& impact : world.waterImpacts) {
-        const float age = t - impact.time;
-        if (static_cast<int32_t>(impact.sourceBody) == excludedBody || age < 0.0f || age >= 4.5f) continue;
-        const float dx = x - impact.x;
-        const float dz = z - impact.z;
-        const float distance = std::sqrt(dx * dx + dz * dz);
-        if (!std::isfinite(distance)) continue;
-        const float phase = 4.6f * distance - 7.2f * age;
-        const float decay = std::exp(-0.27f * distance - 0.92f * age);
-        const float amplitude = 0.23f * impact.strength * decay;
-        wave.height += amplitude * std::sin(phase);
-        wave.verticalVelocity += amplitude * (-0.92f * std::sin(phase) - 7.2f * std::cos(phase));
-        if (distance > 1.0e-4f) {
-            const float radialDerivative = amplitude * (4.6f * std::cos(phase) - 0.27f * std::sin(phase));
-            wave.slopeX += radialDerivative * dx / distance;
-            wave.slopeZ += radialDerivative * dz / distance;
-        }
+        // Keep the source body's wake in the sampled field so its next buoyancy
+        // step feeds back from the impact. Its body-displacement field is
+        // excluded below to avoid a self-lifting equilibrium artifact.
+        const Engine::OceanImpactWaveState impactState{impact.x, impact.z, impact.time, impact.strength};
+        const Engine::OceanWaveSample impactWave = Engine::evaluateOceanImpactWave(x, z, t, impactState);
+        wave.height += impactWave.height;
+        wave.slopeX += impactWave.slopeX;
+        wave.slopeZ += impactWave.slopeZ;
+        wave.verticalVelocity += impactWave.verticalVelocity;
+    }
+    const JPH::BodyInterface& bodies = world.physics.GetBodyInterface();
+    for (size_t index = 0; index < world.floats.size(); ++index) {
+        if (static_cast<int32_t>(index) == excludedBody) continue;
+        const FloatBody& item = world.floats[index];
+        const JPH::RVec3 position = bodies.GetPosition(item.id);
+        const JPH::Vec3 velocity = bodies.GetLinearVelocity(item.id);
+        const JPH::Quat rotation = bodies.GetRotation(item.id);
+        const float rotation4[4] = {rotation.GetX(), rotation.GetY(), rotation.GetZ(), rotation.GetW()};
+        float verticalSupport = 0.0f;
+        const bool supportValid = item.ellipsoid
+            ? Engine::tryGetOrientedEllipsoidVerticalHalfExtent(rotation4, item.halfX, item.halfY,
+                                                                item.halfZ, verticalSupport)
+            : Engine::tryGetOrientedBoxVerticalHalfExtent(rotation4, item.halfX, item.halfY,
+                                                           item.halfZ, verticalSupport);
+        if (!supportValid) continue;
+        const Engine::OceanBodyWaveState body{
+            static_cast<float>(position.GetX()), static_cast<float>(position.GetY()),
+            static_cast<float>(position.GetZ()), item.waterRadius, verticalSupport,
+            velocity.GetX(), velocity.GetY(), velocity.GetZ()
+        };
+        const Engine::OceanWaveSample displacement =
+            Engine::evaluateOceanBodyDisplacement(x, z, t, body);
+        wave.height += displacement.height;
+        wave.slopeX += displacement.slopeX;
+        wave.slopeZ += displacement.slopeZ;
+        wave.verticalVelocity += displacement.verticalVelocity;
     }
     if (!std::isfinite(wave.height) || !std::isfinite(wave.slopeX) ||
         !std::isfinite(wave.slopeZ) || !std::isfinite(wave.verticalVelocity)) return {};
@@ -119,7 +148,9 @@ Engine::OceanWaveSample sampleWaterSurface(const World& world, float x, float z,
 void waveSurface(const World& world, float x, float z, float t, int32_t excludedBody,
                  JPH::RVec3& position, JPH::Vec3& normal, JPH::Vec3& velocity) {
     const Engine::OceanWaveSample wave = sampleWaterSurface(world, x, z, t, excludedBody);
-    const float inverseNormalLength = 1.0f / std::sqrt(1.0f + wave.slopeX * wave.slopeX + wave.slopeZ * wave.slopeZ);
+    const float normalLength = std::hypot(1.0f, wave.slopeX, wave.slopeZ);
+    const float inverseNormalLength = std::isfinite(normalLength) && normalLength > 1.0e-8f
+        ? 1.0f / normalLength : 1.0f;
     position = JPH::RVec3(x, wave.height, z);
     normal = JPH::Vec3(-wave.slopeX * inverseNormalLength, inverseNormalLength, -wave.slopeZ * inverseNormalLength);
     velocity = JPH::Vec3(0.0f, wave.verticalVelocity, 0.0f);
@@ -137,12 +168,21 @@ __declspec(dllexport) JoltWorldHandle* JoltBridge_CreateWorld() {
         JPH::RegisterTypes();
         g_joltInitialized = true;
     }
-    return new JoltWorldHandle();
+    try {
+        JoltWorldHandle* handle = new JoltWorldHandle();
+        ++g_worldCount;
+        return handle;
+    } catch (...) {
+        trace("Could not allocate a Jolt world handle.");
+        return nullptr;
+    }
 }
 
 __declspec(dllexport) void JoltBridge_DestroyWorld(JoltWorldHandle* handle) {
+    if (!handle) return;
     delete handle;
-    if (g_joltInitialized) {
+    if (g_worldCount > 0) --g_worldCount;
+    if (g_joltInitialized && g_worldCount == 0) {
         JPH::UnregisterTypes();
         delete JPH::Factory::sInstance;
         JPH::Factory::sInstance = nullptr;
@@ -154,27 +194,46 @@ __declspec(dllexport) int32_t JoltBridge_AddFloatBody(JoltWorldHandle* handle, i
                                                        float x, float y, float z,
                                                        float halfX, float halfY, float halfZ,
                                                        float buoyancy) {
-    if (!handle) return -1;
-    JPH::RefConst<JPH::Shape> shape;
-    if (shapeKind == 0) {
-        shape = new JPH::SphereShape(halfX);
-    } else {
-        shape = new JPH::BoxShape(JPH::Vec3(halfX, halfY, halfZ), 0.04f);
+    if (!handle || shapeKind < 0 || shapeKind > 2 ||
+        !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) ||
+        !std::isfinite(halfX) || !std::isfinite(halfY) || !std::isfinite(halfZ) ||
+        !std::isfinite(buoyancy) || halfX <= 1.0e-4f || halfY <= 1.0e-4f || halfZ <= 1.0e-4f ||
+        handle->world.floats.size() >= 256) return -1;
+    try {
+        JPH::RefConst<JPH::Shape> shape;
+        if (shapeKind == 0) {
+            shape = new JPH::SphereShape(halfX);
+        } else if (shapeKind == 1) {
+            shape = new JPH::BoxShape(JPH::Vec3(halfX, halfY, halfZ), 0.04f);
+        } else {
+            JPH::RefConst<JPH::Shape> unitSphere = new JPH::SphereShape(1.0f);
+            shape = new JPH::ScaledShape(unitSphere.GetPtr(), JPH::Vec3(halfX, halfY, halfZ));
+        }
+        JPH::BodyCreationSettings settings(shape, JPH::RVec3(x, y, z), JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, kMovingLayer);
+        settings.mFriction = 0.55f;
+        settings.mRestitution = 0.12f;
+        settings.mLinearDamping = 0.12f;
+        settings.mAngularDamping = 0.35f;
+        JPH::BodyInterface& bodies = handle->world.physics.GetBodyInterface();
+        const JPH::BodyID id = bodies.CreateAndAddBody(settings, JPH::EActivation::Activate);
+        if (id.IsInvalid()) return -1;
+        const float radius = std::sqrt(halfX * halfZ);
+        if (!std::isfinite(radius) || radius <= 1.0e-4f) {
+            bodies.RemoveBody(id);
+            bodies.DestroyBody(id);
+            return -1;
+        }
+        handle->world.floats.push_back({id, std::clamp(buoyancy, 0.0f, 2.0f),
+                                        halfX, halfY, halfZ, radius, shapeKind != 1});
+        return static_cast<int32_t>(handle->world.floats.size() - 1);
+    } catch (...) {
+        trace("Body creation failed while allocating a shape or body record.");
+        return -1;
     }
-    JPH::BodyCreationSettings settings(shape, JPH::RVec3(x, y, z), JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, kMovingLayer);
-    settings.mFriction = 0.55f;
-    settings.mRestitution = 0.12f;
-    settings.mLinearDamping = 0.12f;
-    settings.mAngularDamping = 0.35f;
-    JPH::BodyInterface& bodies = handle->world.physics.GetBodyInterface();
-    const JPH::BodyID id = bodies.CreateAndAddBody(settings, JPH::EActivation::Activate);
-    if (id.IsInvalid()) return -1;
-    handle->world.floats.push_back({id, buoyancy});
-    return static_cast<int32_t>(handle->world.floats.size() - 1);
 }
 
-__declspec(dllexport) void JoltBridge_Step(JoltWorldHandle* handle, float dt, float timeSeconds) {
-    if (!handle || dt <= 0.0f) return;
+__declspec(dllexport) int32_t JoltBridge_Step(JoltWorldHandle* handle, float dt, float timeSeconds) {
+    if (!handle || !std::isfinite(dt) || !std::isfinite(timeSeconds) || dt <= 0.0f || dt > 0.1f) return 0;
     World& world = handle->world;
     JPH::BodyInterface& bodies = world.physics.GetBodyInterface();
     const JPH::Vec3 gravity = world.physics.GetGravity();
@@ -186,11 +245,17 @@ __declspec(dllexport) void JoltBridge_Step(JoltWorldHandle* handle, float dt, fl
         // The water-entry event feeds back into its source body as well as nearby
         // bodies, so the body's next buoyancy impulse responds to the wave it made.
         waveSurface(world, static_cast<float>(position.GetX()), static_cast<float>(position.GetZ()), timeSeconds,
-                    -1, surfacePosition, surfaceNormal, fluidVelocity);
+                    static_cast<int32_t>(index), surfacePosition, surfaceNormal, fluidVelocity);
         bodies.ApplyBuoyancyImpulse(item.id, surfacePosition, surfaceNormal, item.buoyancy,
                                     0.35f, 0.9f, fluidVelocity, gravity, dt);
     }
-    world.physics.Update(dt, 1, &world.tempAllocator, &world.jobs);
+    const JPH::EPhysicsUpdateError updateError =
+        world.physics.Update(dt, 1, &world.tempAllocator, &world.jobs);
+    if (updateError != JPH::EPhysicsUpdateError::None) {
+        trace("PhysicsSystem::Update reported error flags 0x%x.", static_cast<unsigned>(updateError));
+        return 0;
+    }
+    return 1;
 }
 
 __declspec(dllexport) uint32_t JoltBridge_GetBodyCount(const JoltWorldHandle* handle) {
@@ -211,6 +276,8 @@ __declspec(dllexport) int32_t JoltBridge_GetBodyTransform(const JoltWorldHandle*
     rotation4[1] = rotation.GetY();
     rotation4[2] = rotation.GetZ();
     rotation4[3] = rotation.GetW();
+    for (int i = 0; i < 3; ++i) if (!std::isfinite(position3[i])) return 0;
+    for (int i = 0; i < 4; ++i) if (!std::isfinite(rotation4[i])) return 0;
     return 1;
 }
 
@@ -232,6 +299,8 @@ __declspec(dllexport) int32_t JoltBridge_GetWaterSurface(const JoltWorldHandle* 
         !std::isfinite(x) || !std::isfinite(z) || !std::isfinite(timeSeconds)) return 0;
     const Engine::OceanWaveSample sample = sampleWaterSurface(handle->world, x, z, timeSeconds,
         static_cast<int32_t>(bodyIndex));
+    if (!std::isfinite(sample.height) || !std::isfinite(sample.slopeX) ||
+        !std::isfinite(sample.slopeZ) || !std::isfinite(sample.verticalVelocity)) return 0;
     sample4[0] = sample.height;
     sample4[1] = sample.slopeX;
     sample4[2] = sample.slopeZ;

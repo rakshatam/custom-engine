@@ -1,6 +1,7 @@
 #include "D3D12Device.h"
 #include <stdexcept>
 #include <iostream>
+#include <limits>
 
 namespace Engine {
 
@@ -176,28 +177,60 @@ void D3D12Device::moveToNextFrame() {
     }
 }
 
-void D3D12Device::resize(uint32_t width, uint32_t height) {
-    if (width == 0 || height == 0) return;
-    if (width == m_width && height == m_height) return;
+bool D3D12Device::resize(uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) return true;
+    if (width == m_width && height == m_height) return true;
+    if (!m_swapChain || !m_device || !m_rtvHeap) return false;
 
     waitForGpu();
 
-    for (uint32_t i = 0; i < FRAME_COUNT; ++i) {
-        m_renderTargets[i].Reset();
+    const uint32_t oldWidth = m_width;
+    const uint32_t oldHeight = m_height;
+    const auto refreshBackBuffers = [&]() {
+        for (auto& target : m_renderTargets) target.Reset();
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        for (uint32_t i = 0; i < FRAME_COUNT; ++i) {
+            const HRESULT getBufferResult = m_swapChain->GetBuffer(i, IID_PPV_ARGS(&m_renderTargets[i]));
+            if (FAILED(getBufferResult) || !m_renderTargets[i]) {
+                std::cerr << "[DXGI Error] GetBuffer failed while rebuilding swap-chain target " << i
+                          << ": HRESULT 0x" << std::hex << getBufferResult << std::dec << ".\n";
+                for (auto& target : m_renderTargets) target.Reset();
+                return false;
+            }
+            m_device->CreateRenderTargetView(m_renderTargets[i].Get(), nullptr, rtvHandle);
+            rtvHandle.ptr += m_rtvDescriptorSize;
+        }
+        return true;
+    };
+
+    for (auto& target : m_renderTargets) target.Reset();
+    const HRESULT resizeResult = m_swapChain->ResizeBuffers(
+        FRAME_COUNT, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, m_swapChainFlags);
+    if (FAILED(resizeResult)) {
+        std::cerr << "[DXGI Warning] ResizeBuffers failed (HRESULT 0x" << std::hex << resizeResult << std::dec
+                  << "); retaining " << oldWidth << "x" << oldHeight << " swap-chain buffers.\n";
+        m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+        return refreshBackBuffers();
     }
 
     m_width = width;
     m_height = height;
-
-    m_swapChain->ResizeBuffers(FRAME_COUNT, m_width, m_height, DXGI_FORMAT_R8G8B8A8_UNORM, m_swapChainFlags);
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    if (refreshBackBuffers()) return true;
 
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
-    for (uint32_t i = 0; i < FRAME_COUNT; ++i) {
-        m_swapChain->GetBuffer(i, IID_PPV_ARGS(&m_renderTargets[i]));
-        m_device->CreateRenderTargetView(m_renderTargets[i].Get(), nullptr, rtvHandle);
-        rtvHandle.ptr += m_rtvDescriptorSize;
+    std::cerr << "[DXGI Error] Could not rebuild resized back buffers; attempting to restore the previous extent.\n";
+    for (auto& target : m_renderTargets) target.Reset();
+    const HRESULT rollbackResult = m_swapChain->ResizeBuffers(
+        FRAME_COUNT, oldWidth, oldHeight, DXGI_FORMAT_R8G8B8A8_UNORM, m_swapChainFlags);
+    if (FAILED(rollbackResult)) {
+        std::cerr << "[DXGI Error] Swap-chain resize rollback failed: HRESULT 0x"
+                  << std::hex << rollbackResult << std::dec << ".\n";
+        return false;
     }
+    m_width = oldWidth;
+    m_height = oldHeight;
+    m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    return refreshBackBuffers();
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::getCurrentBackBufferRtv() const {
@@ -207,22 +240,32 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::getCurrentBackBufferRtv() const {
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Device::getSrvUavCpuHandle(uint32_t index) const {
+    if (!m_srvUavHeap || index >= m_allocatedSrvUavCount || index >= SRV_UAV_DESCRIPTOR_CAPACITY) return {};
     D3D12_CPU_DESCRIPTOR_HANDLE handle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
     handle.ptr += index * m_srvUavDescriptorSize;
     return handle;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE D3D12Device::getSrvUavGpuHandle(uint32_t index) const {
+    if (!m_srvUavHeap || index >= m_allocatedSrvUavCount || index >= SRV_UAV_DESCRIPTOR_CAPACITY) return {};
     D3D12_GPU_DESCRIPTOR_HANDLE handle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
     handle.ptr += index * m_srvUavDescriptorSize;
     return handle;
 }
 
 uint32_t D3D12Device::allocateSrvUavDescriptor() {
+    if (!m_srvUavHeap || m_allocatedSrvUavCount >= SRV_UAV_DESCRIPTOR_CAPACITY) {
+        std::cerr << "[D3D12 Error] Shader-visible descriptor heap is unavailable or exhausted.\n";
+        return std::numeric_limits<uint32_t>::max();
+    }
     return m_allocatedSrvUavCount++;
 }
 
 ComPtr<ID3D12Resource> D3D12Device::createBuffer(uint64_t size, D3D12_HEAP_TYPE heapType, D3D12_RESOURCE_STATES initialState, D3D12_RESOURCE_FLAGS flags) {
+    if (!m_device || size == 0) {
+        std::cerr << "[D3D12 Error] Refused to create a buffer without a device or with zero bytes.\n";
+        return {};
+    }
     D3D12_HEAP_PROPERTIES heapProps = {};
     heapProps.Type = heapType;
 
@@ -251,6 +294,10 @@ ComPtr<ID3D12Resource> D3D12Device::createBuffer(uint64_t size, D3D12_HEAP_TYPE 
 }
 
 ComPtr<ID3D12Resource> D3D12Device::createTexture2D(uint32_t width, uint32_t height, DXGI_FORMAT format, D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES initialState) {
+    if (!m_device || width == 0 || height == 0) {
+        std::cerr << "[D3D12 Error] Refused to create a texture without a device or with zero dimensions.\n";
+        return {};
+    }
     D3D12_HEAP_PROPERTIES heapProps = {};
     heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -266,12 +313,20 @@ ComPtr<ID3D12Resource> D3D12Device::createTexture2D(uint32_t width, uint32_t hei
     desc.Flags = flags;
 
     ComPtr<ID3D12Resource> resource;
-    m_device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, initialState, nullptr, IID_PPV_ARGS(&resource));
+    const HRESULT hr = m_device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, initialState, nullptr, IID_PPV_ARGS(&resource));
+    if (FAILED(hr)) {
+        std::cerr << "[D3D12 Error] Create texture failed: HRESULT 0x" << std::hex << hr << std::dec
+                  << " dimensions=" << width << "x" << height << " format=" << format << ".\n";
+    }
     return resource;
 }
 
 void D3D12Device::transitionBarrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
     if (before == after) return;
+    if (!m_commandList || !resource) {
+        std::cerr << "[D3D12 Error] Skipped resource transition with a null command list/resource.\n";
+        return;
+    }
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = resource;
@@ -282,6 +337,10 @@ void D3D12Device::transitionBarrier(ID3D12Resource* resource, D3D12_RESOURCE_STA
 }
 
 void D3D12Device::uavBarrier(ID3D12Resource* resource) {
+    if (!m_commandList || !resource) {
+        std::cerr << "[D3D12 Error] Skipped UAV barrier with a null command list/resource.\n";
+        return;
+    }
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barrier.UAV.pResource = resource;

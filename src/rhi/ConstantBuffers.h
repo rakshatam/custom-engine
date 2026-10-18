@@ -76,7 +76,7 @@ struct SceneCB {
     XMFLOAT4   oceanBodyPositionRadius[8]; // xyz world position, w horizontal wake radius.
     XMFLOAT4   oceanBodyVelocityImpact[8]; // x/y horizontal velocity, z impact time, w impact strength.
     XMFLOAT4   oceanBodyImpactPositionRadius[8]; // xyz pinned impact origin, w body wake radius.
-    XMFLOAT4   oceanBodyVerticalState[8]; // x vertical velocity, remaining components reserved.
+    XMFLOAT4   oceanBodyVerticalState[8]; // x vertical velocity, y vertical support half-extent, z immersion fraction.
 };
 
 static_assert(offsetof(SceneCB, oceanBodyPositionRadius) % 16 == 0,

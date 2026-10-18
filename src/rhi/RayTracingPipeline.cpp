@@ -7,7 +7,10 @@
 #include "../core/ImageCapture.h"
 #include <bit>
 #include <cstring>
+#include <iostream>
 #include <iterator>
+#include <limits>
+#include <utility>
 #include <vector>
 
 namespace Engine {
@@ -27,7 +30,11 @@ bool RayTracingPipeline::init(D3D12Device& device, uint32_t renderWidth, uint32_
 #if ENGINE_ENABLE_NRD
     m_nrd = std::make_unique<NRDDenoiser>();
     if (createNrdCompositePipeline(device)) {
-        m_nrd->initialize(device, renderWidth, renderHeight);
+        if (!m_nrd->initialize(device, renderWidth, renderHeight)) {
+            std::cerr << "[NRD Warning] Denoiser initialization failed; direct ray-traced output remains available.\n";
+        }
+    } else {
+        std::cerr << "[NRD Warning] Composite pipeline creation failed; direct ray-traced output remains available.\n";
     }
 #endif
     return true;
@@ -275,8 +282,7 @@ bool RayTracingPipeline::createPipelineState(D3D12Device& device) {
         return false;
     }
 
-    m_stateObject.As(&m_stateObjectProperties);
-    return true;
+    return SUCCEEDED(m_stateObject.As(&m_stateObjectProperties)) && m_stateObjectProperties;
 }
 
 bool RayTracingPipeline::createShaderBindingTable(D3D12Device& device) {
@@ -292,73 +298,99 @@ bool RayTracingPipeline::createShaderBindingTable(D3D12Device& device) {
 
     uint64_t sbtSize = rayGenSectionSize + missSectionSize + hitGroupSectionSize;
 
-    m_shaderBindingTable = device.createBuffer(sbtSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    ComPtr<ID3D12Resource> shaderBindingTable = device.createBuffer(
+        sbtSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    if (!shaderBindingTable) return false;
 
     uint8_t* mappedData = nullptr;
-    m_shaderBindingTable->Map(0, nullptr, reinterpret_cast<void**>(&mappedData));
+    if (FAILED(shaderBindingTable->Map(0, nullptr, reinterpret_cast<void**>(&mappedData))) || !mappedData) return false;
 
     // 1. RayGen Record
     void* rayGenId = m_stateObjectProperties->GetShaderIdentifier(L"RayGenShader");
+    void* missId = m_stateObjectProperties->GetShaderIdentifier(L"MissShader");
+    void* shadowMissId = m_stateObjectProperties->GetShaderIdentifier(L"ShadowMissShader");
+    void* hitGroupId = m_stateObjectProperties->GetShaderIdentifier(L"HitGroup_PBR");
+    if (!rayGenId || !missId || !shadowMissId || !hitGroupId) {
+        shaderBindingTable->Unmap(0, nullptr);
+        std::cerr << "[DXR Error] Shader identifier missing while building the shader binding table.\n";
+        return false;
+    }
     std::memcpy(mappedData, rayGenId, shaderIdSize);
 
     // 2. Miss Records (Primary Miss + Shadow Miss)
     uint8_t* missPtr = mappedData + rayGenSectionSize;
-    void* missId = m_stateObjectProperties->GetShaderIdentifier(L"MissShader");
     std::memcpy(missPtr, missId, shaderIdSize);
-
-    void* shadowMissId = m_stateObjectProperties->GetShaderIdentifier(L"ShadowMissShader");
     std::memcpy(missPtr + m_missRecordSize, shadowMissId, shaderIdSize);
 
     // 3. HitGroup Record
     uint8_t* hitGroupPtr = mappedData + rayGenSectionSize + missSectionSize;
-    void* hitGroupId = m_stateObjectProperties->GetShaderIdentifier(L"HitGroup_PBR");
     std::memcpy(hitGroupPtr, hitGroupId, shaderIdSize);
 
-    m_shaderBindingTable->Unmap(0, nullptr);
+    shaderBindingTable->Unmap(0, nullptr);
+    m_shaderBindingTable = std::move(shaderBindingTable);
     return true;
 }
 
 bool RayTracingPipeline::createOutputResources(D3D12Device& device, uint32_t width, uint32_t height) {
-    m_renderWidth = width;
-    m_renderHeight = height;
+    if (!device.getDevice() || width == 0 || height == 0) return false;
 
-    m_outputTexture = device.createTexture2D(
-        m_renderWidth, m_renderHeight,
+    ComPtr<ID3D12Resource> outputTexture = device.createTexture2D(
+        width, height,
         DXGI_FORMAT_R8G8B8A8_UNORM,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
 
-    m_accumulationTexture = device.createTexture2D(
-        m_renderWidth, m_renderHeight,
+    ComPtr<ID3D12Resource> accumulationTexture = device.createTexture2D(
+        width, height,
         DXGI_FORMAT_R32G32B32A32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
 
-    m_historyTexture = device.createTexture2D(
-        m_renderWidth, m_renderHeight,
+    ComPtr<ID3D12Resource> historyTexture = device.createTexture2D(
+        width, height,
         DXGI_FORMAT_R32G32B32A32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
+    if (!outputTexture || !accumulationTexture || !historyTexture) {
+        std::cerr << "[DXR Error] Primary render texture allocation failed at " << width << "x" << height << ".\n";
+        return false;
+    }
 
 #if ENGINE_ENABLE_NRD
-    m_nrdSignalTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
+    ComPtr<ID3D12Resource> nrdSignalTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_nrdNormalRoughnessTexture = device.createTexture2D(width, height, DXGI_FORMAT_R10G10B10A2_UNORM,
+    ComPtr<ID3D12Resource> nrdNormalRoughnessTexture = device.createTexture2D(width, height, DXGI_FORMAT_R10G10B10A2_UNORM,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_nrdViewZTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32_FLOAT,
+    ComPtr<ID3D12Resource> nrdViewZTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_nrdMotionTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
+    ComPtr<ID3D12Resource> nrdMotionTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_nrdAlbedoTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
+    ComPtr<ID3D12Resource> nrdAlbedoTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_nrdOutputTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
+    ComPtr<ID3D12Resource> nrdOutputTexture = device.createTexture2D(width, height, DXGI_FORMAT_R32G32B32A32_FLOAT,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    if (!m_nrdSignalTexture || !m_nrdNormalRoughnessTexture || !m_nrdViewZTexture ||
-        !m_nrdMotionTexture || !m_nrdAlbedoTexture || !m_nrdOutputTexture) return false;
+    if (!nrdSignalTexture || !nrdNormalRoughnessTexture || !nrdViewZTexture ||
+        !nrdMotionTexture || !nrdAlbedoTexture || !nrdOutputTexture) {
+        std::cerr << "[NRD Error] Denoiser texture allocation failed at " << width << "x" << height << ".\n";
+        return false;
+    }
 #endif
+
+    const uint64_t rowPitch64 = (static_cast<uint64_t>(width) * 4u +
+        D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u) &
+        ~static_cast<uint64_t>(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1u);
+    if (rowPitch64 > std::numeric_limits<uint32_t>::max() ||
+        rowPitch64 == 0 || height > std::numeric_limits<uint64_t>::max() / rowPitch64) return false;
+    const uint32_t readbackRowPitch = static_cast<uint32_t>(rowPitch64);
+    ComPtr<ID3D12Resource> readbackBuffer = device.createBuffer(
+        rowPitch64 * height, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (!readbackBuffer) {
+        std::cerr << "[DXR Error] Readback allocation failed at " << width << "x" << height << ".\n";
+        return false;
+    }
 
     if (!m_descriptorsAllocated) {
         m_outputUavIndex = device.allocateSrvUavDescriptor();
@@ -378,6 +410,20 @@ bool RayTracingPipeline::createOutputResources(D3D12Device& device, uint32_t wid
         m_nrdAlbedoSrvIndex = device.allocateSrvUavDescriptor();
         m_nrdViewZSrvIndex = device.allocateSrvUavDescriptor();
 #endif
+        const uint32_t descriptorIndices[] = {
+            m_outputUavIndex, m_accumulationUavIndex, m_historyUavIndex, m_outputSrvIndex,
+#if ENGINE_ENABLE_NRD
+            m_nrdSignalUavIndex, m_nrdNormalRoughnessUavIndex, m_nrdViewZUavIndex,
+            m_nrdMotionUavIndex, m_nrdAlbedoUavIndex, m_accumulationSrvIndex,
+            m_nrdOutputSrvIndex, m_nrdAlbedoSrvIndex, m_nrdViewZSrvIndex
+#endif
+        };
+        for (uint32_t index : descriptorIndices) {
+            if (index == 0xffffffffu) {
+                std::cerr << "[DXR Error] Descriptor allocation exhausted while creating render-target views.\n";
+                return false;
+            }
+        }
         m_descriptorsAllocated = true;
     }
 
@@ -385,32 +431,32 @@ bool RayTracingPipeline::createOutputResources(D3D12Device& device, uint32_t wid
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc0 = {};
     uavDesc0.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     uavDesc0.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device.getDevice()->CreateUnorderedAccessView(m_outputTexture.Get(), nullptr, &uavDesc0, device.getSrvUavCpuHandle(m_outputUavIndex));
+    device.getDevice()->CreateUnorderedAccessView(outputTexture.Get(), nullptr, &uavDesc0, device.getSrvUavCpuHandle(m_outputUavIndex));
 
     // UAV u1 for accumulation buffer
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc1 = {};
     uavDesc1.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     uavDesc1.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device.getDevice()->CreateUnorderedAccessView(m_accumulationTexture.Get(), nullptr, &uavDesc1, device.getSrvUavCpuHandle(m_accumulationUavIndex));
+    device.getDevice()->CreateUnorderedAccessView(accumulationTexture.Get(), nullptr, &uavDesc1, device.getSrvUavCpuHandle(m_accumulationUavIndex));
 
     // UAV u2 for the temporal history and progressive accumulation.
     D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc2 = {};
     uavDesc2.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     uavDesc2.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-    device.getDevice()->CreateUnorderedAccessView(m_historyTexture.Get(), nullptr, &uavDesc2, device.getSrvUavCpuHandle(m_historyUavIndex));
+    device.getDevice()->CreateUnorderedAccessView(historyTexture.Get(), nullptr, &uavDesc2, device.getSrvUavCpuHandle(m_historyUavIndex));
 
 #if ENGINE_ENABLE_NRD
     D3D12_UNORDERED_ACCESS_VIEW_DESC nrdUavDesc = {};
     nrdUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     nrdUavDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    device.getDevice()->CreateUnorderedAccessView(m_nrdSignalTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdSignalUavIndex));
+    device.getDevice()->CreateUnorderedAccessView(nrdSignalTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdSignalUavIndex));
     nrdUavDesc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-    device.getDevice()->CreateUnorderedAccessView(m_nrdNormalRoughnessTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdNormalRoughnessUavIndex));
+    device.getDevice()->CreateUnorderedAccessView(nrdNormalRoughnessTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdNormalRoughnessUavIndex));
     nrdUavDesc.Format = DXGI_FORMAT_R32_FLOAT;
-    device.getDevice()->CreateUnorderedAccessView(m_nrdViewZTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdViewZUavIndex));
+    device.getDevice()->CreateUnorderedAccessView(nrdViewZTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdViewZUavIndex));
     nrdUavDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    device.getDevice()->CreateUnorderedAccessView(m_nrdMotionTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdMotionUavIndex));
-    device.getDevice()->CreateUnorderedAccessView(m_nrdAlbedoTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdAlbedoUavIndex));
+    device.getDevice()->CreateUnorderedAccessView(nrdMotionTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdMotionUavIndex));
+    device.getDevice()->CreateUnorderedAccessView(nrdAlbedoTexture.Get(), nullptr, &nrdUavDesc, device.getSrvUavCpuHandle(m_nrdAlbedoUavIndex));
 #endif
 
     // SRV for ImGui Viewport rendering
@@ -419,7 +465,7 @@ bool RayTracingPipeline::createOutputResources(D3D12Device& device, uint32_t wid
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Texture2D.MipLevels = 1;
-    device.getDevice()->CreateShaderResourceView(m_outputTexture.Get(), &srvDesc, device.getSrvUavCpuHandle(m_outputSrvIndex));
+    device.getDevice()->CreateShaderResourceView(outputTexture.Get(), &srvDesc, device.getSrvUavCpuHandle(m_outputSrvIndex));
 
 #if ENGINE_ENABLE_NRD
     D3D12_SHADER_RESOURCE_VIEW_DESC floatSrvDesc = {};
@@ -427,31 +473,42 @@ bool RayTracingPipeline::createOutputResources(D3D12Device& device, uint32_t wid
     floatSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     floatSrvDesc.Texture2D.MipLevels = 1;
     floatSrvDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    device.getDevice()->CreateShaderResourceView(m_accumulationTexture.Get(), &floatSrvDesc, device.getSrvUavCpuHandle(m_accumulationSrvIndex));
-    device.getDevice()->CreateShaderResourceView(m_nrdOutputTexture.Get(), &floatSrvDesc, device.getSrvUavCpuHandle(m_nrdOutputSrvIndex));
-    device.getDevice()->CreateShaderResourceView(m_nrdAlbedoTexture.Get(), &floatSrvDesc, device.getSrvUavCpuHandle(m_nrdAlbedoSrvIndex));
+    device.getDevice()->CreateShaderResourceView(accumulationTexture.Get(), &floatSrvDesc, device.getSrvUavCpuHandle(m_accumulationSrvIndex));
+    device.getDevice()->CreateShaderResourceView(nrdOutputTexture.Get(), &floatSrvDesc, device.getSrvUavCpuHandle(m_nrdOutputSrvIndex));
+    device.getDevice()->CreateShaderResourceView(nrdAlbedoTexture.Get(), &floatSrvDesc, device.getSrvUavCpuHandle(m_nrdAlbedoSrvIndex));
     floatSrvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-    device.getDevice()->CreateShaderResourceView(m_nrdViewZTexture.Get(), &floatSrvDesc, device.getSrvUavCpuHandle(m_nrdViewZSrvIndex));
-    m_nrdOutputIsShaderResource = false;
+    device.getDevice()->CreateShaderResourceView(nrdViewZTexture.Get(), &floatSrvDesc, device.getSrvUavCpuHandle(m_nrdViewZSrvIndex));
 #endif
 
-    m_readbackRowPitch = (m_renderWidth * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
-    m_readbackBuffer = device.createBuffer(
-        static_cast<uint64_t>(m_readbackRowPitch) * m_renderHeight,
-        D3D12_HEAP_TYPE_READBACK,
-        D3D12_RESOURCE_STATE_COPY_DEST
-    );
-
+    m_outputTexture = std::move(outputTexture);
+    m_accumulationTexture = std::move(accumulationTexture);
+    m_historyTexture = std::move(historyTexture);
+#if ENGINE_ENABLE_NRD
+    m_nrdSignalTexture = std::move(nrdSignalTexture);
+    m_nrdNormalRoughnessTexture = std::move(nrdNormalRoughnessTexture);
+    m_nrdViewZTexture = std::move(nrdViewZTexture);
+    m_nrdMotionTexture = std::move(nrdMotionTexture);
+    m_nrdAlbedoTexture = std::move(nrdAlbedoTexture);
+    m_nrdOutputTexture = std::move(nrdOutputTexture);
+    m_nrdOutputIsShaderResource = false;
+#endif
+    m_readbackBuffer = std::move(readbackBuffer);
+    m_readbackRowPitch = readbackRowPitch;
+    m_renderWidth = width;
+    m_renderHeight = height;
     return true;
 }
 
-void RayTracingPipeline::resizeOutput(D3D12Device& device, uint32_t renderWidth, uint32_t renderHeight) {
-    if (renderWidth == m_renderWidth && renderHeight == m_renderHeight) return;
+bool RayTracingPipeline::resizeOutput(D3D12Device& device, uint32_t renderWidth, uint32_t renderHeight) {
+    if (renderWidth == m_renderWidth && renderHeight == m_renderHeight) return true;
     device.waitForGpu();
-    createOutputResources(device, renderWidth, renderHeight);
+    if (!createOutputResources(device, renderWidth, renderHeight)) return false;
 #if ENGINE_ENABLE_NRD
-    if (m_nrd) m_nrd->initialize(device, renderWidth, renderHeight);
+    if (m_nrd && !m_nrd->initialize(device, renderWidth, renderHeight)) {
+        std::cerr << "[NRD Warning] Denoiser resize failed; direct ray-traced output remains available.\n";
+    }
 #endif
+    return true;
 }
 
 void RayTracingPipeline::dispatch(D3D12Device& device,

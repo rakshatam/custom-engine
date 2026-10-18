@@ -23,7 +23,7 @@ public:
     ~RayTracingPipeline();
 
     bool init(D3D12Device& device, uint32_t renderWidth, uint32_t renderHeight);
-    void resizeOutput(D3D12Device& device, uint32_t renderWidth, uint32_t renderHeight);
+    bool resizeOutput(D3D12Device& device, uint32_t renderWidth, uint32_t renderHeight);
 
     void dispatch(D3D12Device& device, 
                   D3D12_GPU_VIRTUAL_ADDRESS tlasAddress,

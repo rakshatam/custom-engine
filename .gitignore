@@ -33,3 +33,6 @@ Thumbs.db
 .DS_Store
 /*.tmp
 /*.bak
+
+# Local engineering checkpoint; keep it out of repository pushes
+/ENGINE_CHECKPOINT.md

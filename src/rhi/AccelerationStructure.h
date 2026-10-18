@@ -56,6 +56,7 @@ private:
     ComPtr<ID3D12Resource> m_resultBuffer;
     std::array<ComPtr<ID3D12Resource>, D3D12Device::FRAME_COUNT> m_instanceDescBuffers;
     uint32_t m_maxInstances = 0;
+    uint32_t m_builtInstanceCount = 0;
     bool m_built = false;
 };
 

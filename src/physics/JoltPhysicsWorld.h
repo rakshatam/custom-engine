@@ -15,7 +15,8 @@ public:
     bool initialize();
     int32_t addSphere(float x, float y, float z, float radius, float buoyancy = 1.9f);
     int32_t addBox(float x, float y, float z, float halfX, float halfY, float halfZ, float buoyancy = 1.9f);
-    void step(float dt, float timeSeconds);
+    int32_t addEllipsoid(float x, float y, float z, float halfX, float halfY, float halfZ, float buoyancy = 1.9f);
+    bool step(float dt, float timeSeconds);
     bool getTransform(uint32_t index, float position[3], float rotation[4]) const;
     bool getLinearVelocity(uint32_t index, float velocity[3]) const;
     bool getWaterSurface(uint32_t bodyIndex, float x, float z, float timeSeconds, float sample[4]) const;
@@ -27,7 +28,7 @@ private:
     using CreateWorldFn = void* (*)();
     using DestroyWorldFn = void (*)(void*);
     using AddFloatBodyFn = int32_t (*)(void*, int32_t, float, float, float, float, float, float, float);
-    using StepFn = void (*)(void*, float, float);
+    using StepFn = int32_t (*)(void*, float, float);
     using GetBodyCountFn = uint32_t (*)(const void*);
     using GetBodyTransformFn = int32_t (*)(const void*, uint32_t, float*, float*);
     using GetBodyLinearVelocityFn = int32_t (*)(const void*, uint32_t, float*);

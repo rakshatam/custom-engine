@@ -274,6 +274,97 @@ void evaluateOceanSurface(float x, float z, float time, float pixelFootprint,
                - a2 * 0.78f * cos(p2) - a3 * 0.18f * cos(p3) + a4 * 1.82f * cos(p4);
 }
 
+// Shared analytic interaction height used both to intersect the displaced
+// water surface and to shade it. The flat quad in the BLAS is only a broad
+// phase; this function supplies the actual primary-ray height field.
+void evaluateOceanInteractionSurface(float x, float z, float time, float pixelFootprint,
+                                     out float height, out float2 gradient, out float foam) {
+    evaluateOceanSurface(x, z, time, pixelFootprint, height, gradient);
+    foam = 0.0f;
+    const uint bodyCount = min(g_SceneCB.oceanBodyCount, 8u);
+    [loop]
+    for (uint bodyIndex = 0; bodyIndex < bodyCount; ++bodyIndex) {
+        const float4 body = g_SceneCB.oceanBodyPositionRadius[bodyIndex];
+        const float4 motion = g_SceneCB.oceanBodyVelocityImpact[bodyIndex];
+        const float4 impactOrigin = g_SceneCB.oceanBodyImpactPositionRadius[bodyIndex];
+        const float verticalVelocity = g_SceneCB.oceanBodyVerticalState[bodyIndex].x;
+        const float2 delta = float2(x - body.x, z - body.z);
+        const float distanceToBody = length(delta);
+        const float radius = max(body.w, 0.25f);
+        const float submersion = saturate(g_SceneCB.oceanBodyVerticalState[bodyIndex].z);
+        const float radiusSquared = radius * radius;
+        const float radialSquared = dot(delta, delta) / radiusSquared;
+        const float normalizedRadius = sqrt(radialSquared);
+        const float innerDisplacement = exp(-radialSquared);
+        const float ridgeCoordinate = (radialSquared - 2.25f) / 2.0f;
+        const float ridgeDisplacement = exp(-ridgeCoordinate * ridgeCoordinate);
+        const float displacementProfile = -innerDisplacement + 0.2987677926f * ridgeDisplacement;
+        const float displacementAmplitude = min(0.45f * radius, 0.45f) * submersion;
+        height += displacementAmplitude * displacementProfile;
+        const float ridgeSlopeFactor = 2.0f * 0.2987677926f * ridgeDisplacement * ridgeCoordinate;
+        gradient += displacementAmplitude * (delta / radiusSquared)
+            * (2.0f * innerDisplacement - ridgeSlopeFactor);
+        if (submersion > 0.01f) {
+            const float bodyRim = abs(distanceToBody - 1.36f * radius);
+            foam = max(foam, 0.22f * submersion
+                * (1.0f - smoothstep(0.08f, 0.34f, bodyRim)));
+        }
+
+        const float impactAge = time - motion.z;
+        const float impactStrength = saturate(motion.w);
+        if (impactStrength > 0.001f && impactAge >= 0.0f && impactAge < 4.5f) {
+            const float2 impactDelta = float2(x - impactOrigin.x, z - impactOrigin.z);
+            const float impactDistanceRoot = sqrt(max(dot(impactDelta, impactDelta), 0.0f) + 0.0004f);
+            const float impactDistance = impactDistanceRoot - 0.02f;
+            const float phase = 4.6f * impactDistance - 7.2f * impactAge;
+            const float decay = exp(-0.27f * impactDistance - 0.92f * impactAge);
+            const float amplitude = 0.23f * impactStrength * decay;
+            height += amplitude * sin(phase);
+            const float radialDerivative = amplitude
+                * (4.6f * cos(phase) - 0.27f * sin(phase));
+            gradient += radialDerivative * (impactDelta / impactDistanceRoot);
+            const float ringDistance = abs(impactDistance - radius * 0.8f - 1.8f * impactAge);
+            foam = max(foam, impactStrength * exp(-2.0f * impactAge)
+                * (1.0f - smoothstep(0.04f, 0.22f, ringDistance)));
+        }
+
+        const float bodyDistanceRoot = sqrt(max(dot(delta, delta), 0.0f) + 0.0004f);
+        const float smoothBodyDistance = bodyDistanceRoot - 0.02f;
+        const float bobEnergy = submersion * saturate(abs(verticalVelocity) * 0.25f);
+        if (bobEnergy > 0.01f) {
+            const float bobPhase = 4.0f * smoothBodyDistance - 2.8f * time
+                + (verticalVelocity < 0.0f ? 0.0f : 3.14159265f);
+            const float bobEnvelope = exp(-0.5f * smoothBodyDistance);
+            const float bobAmplitude = 0.10f * bobEnergy * bobEnvelope;
+            height += bobAmplitude * sin(bobPhase);
+            const float radialBobDerivative = bobAmplitude
+                * (4.0f * cos(bobPhase) - 0.5f * sin(bobPhase));
+            gradient += radialBobDerivative * (delta / bodyDistanceRoot);
+        }
+
+        const float2 horizontalVelocity = motion.xy;
+        const float horizontalSpeed = length(horizontalVelocity);
+        if (horizontalSpeed > 0.08f) {
+            const float2 forward = horizontalVelocity / horizontalSpeed;
+            const float2 side = float2(-forward.y, forward.x);
+            const float along = dot(delta, forward);
+            const float across = dot(delta, side);
+            const float smoothAbsAcross = sqrt(across * across + 0.0004f) - 0.02f;
+            const float wakeEnvelope = exp(-max(-along, 0.0f) * 0.22f - smoothAbsAcross * 0.48f);
+            const float wakePhase = 1.45f * along + 2.8f * across - 1.3f * time;
+            const float wakeAmplitude = 0.10f * saturate(horizontalSpeed * 0.16f);
+            height += wakeAmplitude * wakeEnvelope * sin(wakePhase);
+            const float envelopeAlongDerivative = along < 0.0f ? 0.22f : 0.0f;
+            const float envelopeAcrossDerivative = -0.48f * across / sqrt(across * across + 0.0004f);
+            const float derivativeAlong = wakeAmplitude * wakeEnvelope
+                * (envelopeAlongDerivative * sin(wakePhase) + 1.45f * cos(wakePhase));
+            const float derivativeAcross = wakeAmplitude * wakeEnvelope
+                * (envelopeAcrossDerivative * sin(wakePhase) + 2.8f * cos(wakePhase));
+            gradient += derivativeAlong * forward + derivativeAcross * side;
+        }
+    }
+}
+
 // Analytic atmosphere with a low-cost procedural cloud layer in the ocean scene.
 float3 evaluateSky(float3 rayDir, bool includeSolarDisk) {
     rayDir = safeNormalize(rayDir, float3(0.0f, 1.0f, 0.0f));
@@ -333,6 +424,43 @@ float geometrySmith(float3 N, float3 V, float3 L, float roughness) {
     float ggx2 = geometrySchlickGGX(NdotV, roughness);
     float ggx1 = geometrySchlickGGX(NdotL, roughness);
     return ggx1 * ggx2;
+}
+
+float3 sampleGGXVisibleNormal(float3 N, float3 V, float alpha, float2 u) {
+    // Heitz's isotropic GGX VNDF sampler. Stretch the view into the GGX
+    // configuration, sample the projected visible disk, then unstretch H.
+    const float3 up = abs(N.y) < 0.999f ? float3(0.0f, 1.0f, 0.0f)
+                                         : float3(1.0f, 0.0f, 0.0f);
+    const float3 T = safeNormalize(cross(up, N), float3(1.0f, 0.0f, 0.0f));
+    const float3 B = cross(N, T);
+    const float3 localV = float3(dot(V, T), dot(V, B), max(dot(V, N), 1.0e-5f));
+    const float3 stretchedV = safeNormalize(float3(alpha * localV.x, alpha * localV.y, localV.z),
+                                             float3(0.0f, 0.0f, 1.0f));
+    const float lensq = stretchedV.x * stretchedV.x + stretchedV.y * stretchedV.y;
+    const float3 diskT1 = lensq > 1.0e-8f
+        ? float3(-stretchedV.y, stretchedV.x, 0.0f) * rsqrt(lensq)
+        : float3(1.0f, 0.0f, 0.0f);
+    const float3 diskT2 = cross(stretchedV, diskT1);
+    const float radius = sqrt(saturate(u.x));
+    const float phi = 2.0f * PI * saturate(u.y);
+    const float diskX = radius * cos(phi);
+    float diskY = radius * sin(phi);
+    const float blend = 0.5f * (1.0f + stretchedV.z);
+    diskY = (1.0f - blend) * sqrt(max(1.0f - diskX * diskX, 0.0f)) + blend * diskY;
+    const float normalZ = sqrt(max(1.0f - diskX * diskX - diskY * diskY, 0.0f));
+    const float3 stretchedH = diskX * diskT1 + diskY * diskT2 + normalZ * stretchedV;
+    const float3 localH = safeNormalize(float3(alpha * stretchedH.x, alpha * stretchedH.y,
+                                                max(stretchedH.z, 0.0f)),
+                                          float3(0.0f, 0.0f, 1.0f));
+    return safeNormalize(T * localH.x + B * localH.y + N * localH.z, N);
+}
+
+float smithGGXG1(float NdotDirection, float alpha) {
+    const float nDotV = saturate(NdotDirection);
+    if (nDotV <= 1.0e-6f) return 0.0f;
+    const float alpha2 = alpha * alpha;
+    return (2.0f * nDotV) /
+        max(nDotV + sqrt(max(alpha2 + (1.0f - alpha2) * nDotV * nDotV, 0.0f)), 1.0e-6f);
 }
 
 float3 fresnelSchlick(float cosTheta, float3 F0) {
@@ -858,14 +986,46 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
     // keep the flag at zero and continue through the original PBR/GI path.
     if (mat.pad.x > 0.5f) {
         const float t = g_SceneCB.padPrev1;
-        const float x = hitPos.x;
-        const float z = hitPos.z;
+        float waterRayT = RayTCurrent();
+        float x = hitPos.x;
+        float z = hitPos.z;
         float waveHeight;
         float2 waveGradient;
+        float impactFoam = 0.0f;
         const float pixelFootprint = max(RayTCurrent(), 0.0f) * 2.0f * tan(g_SceneCB.fovY * 0.5f)
                                    / max(float(g_SceneCB.renderHeight), 1.0f);
+        const float3 waterRayOrigin = WorldRayOrigin();
+        const float3 waterRayDirection = WorldRayDirection();
+
+        // The triangle quad is a conservative broad-phase surface. Re-solve
+        // the ray against the analytic base + body + impact height field so
+        // the visible hit and its depth move with the waves and floating props.
+        [unroll]
+        for (uint iteration = 0; iteration < 3; ++iteration) {
+            float2 intersectionGradient;
+            float intersectionHeight;
+            float intersectionFoam;
+            evaluateOceanInteractionSurface(x, z, t, pixelFootprint,
+                intersectionHeight, intersectionGradient, intersectionFoam);
+            const float residual = hitPos.y - intersectionHeight;
+            const float rayDerivative = waterRayDirection.y
+                - dot(intersectionGradient, float2(waterRayDirection.x, waterRayDirection.z));
+            if (!isfinite(residual) || !isfinite(rayDerivative) || abs(residual) < 0.001f ||
+                abs(rayDerivative) < 0.12f) break;
+
+            const float maxRayStep = min(2.0f, 0.75f / max(abs(waterRayDirection.y), 0.25f));
+            const float correction = clamp(residual / rayDerivative, -maxRayStep, maxRayStep);
+            const float nextRayT = max(0.001f, waterRayT - correction);
+            if (!isfinite(nextRayT) || abs(nextRayT - waterRayT) < 1.0e-5f) break;
+            waterRayT = nextRayT;
+            hitPos = waterRayOrigin + waterRayDirection * waterRayT;
+            x = hitPos.x;
+            z = hitPos.z;
+        }
+
+        // Re-evaluate shading at the corrected point. Height and waveGradient
+        // below remain the exact analytic pair used by the Newton iterations.
         evaluateOceanSurface(x, z, t, pixelFootprint, waveHeight, waveGradient);
-        float impactFoam = 0.0f;
         const uint bodyCount = min(g_SceneCB.oceanBodyCount, 8u);
         [loop]
         for (uint bodyIndex = 0; bodyIndex < bodyCount; ++bodyIndex) {
@@ -877,18 +1037,26 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
             const float distanceToBody = length(delta);
             const float radius = max(body.w, 0.25f);
 
-            // Only bodies actually intersecting the analytic water height
-            // push the proxy surface down; airborne props must not dent it.
-            const float submersion = saturate((radius + 0.06f - body.y) / max(2.0f * radius, 0.1f));
-            if (submersion > 0.0f) {
-                const float contact = exp(-distanceToBody * distanceToBody / max(radius * radius * 0.65f, 0.08f));
-                const float contactAmplitude = 0.09f * submersion;
-                const float radialContactDerivative = 2.0f * contactAmplitude * contact * distanceToBody
-                    / max(radius * radius * 0.65f, 0.08f);
-                waveHeight -= contactAmplitude * contact;
-                if (distanceToBody > 1.0e-4f) {
-                    waveGradient += radialContactDerivative * (delta / distanceToBody);
-                }
+            // The CPU computes wetness from the same base wave and body half-height
+            // used by Jolt. A negative core and positive annulus approximate volume
+            // displacement around a floating body, even when it is nearly still.
+            const float submersion = saturate(g_SceneCB.oceanBodyVerticalState[bodyIndex].z);
+            const float radiusSquared = radius * radius;
+            const float radialSquared = dot(delta, delta) / radiusSquared;
+            const float normalizedRadius = sqrt(radialSquared);
+            const float innerDisplacement = exp(-radialSquared);
+            const float ridgeCoordinate = (radialSquared - 2.25f) / 2.0f;
+            const float ridgeDisplacement = exp(-ridgeCoordinate * ridgeCoordinate);
+            const float displacementProfile = -innerDisplacement + 0.2987677926f * ridgeDisplacement;
+            const float displacementAmplitude = min(0.45f * radius, 0.45f) * submersion;
+            waveHeight += displacementAmplitude * displacementProfile;
+            const float ridgeSlopeFactor = 2.0f * 0.2987677926f * ridgeDisplacement * ridgeCoordinate;
+            waveGradient += displacementAmplitude * (delta / radiusSquared)
+                * (2.0f * innerDisplacement - ridgeSlopeFactor);
+            if (submersion > 0.01f) {
+                const float bodyRim = abs(distanceToBody - 1.36f * radius);
+                impactFoam = max(impactFoam, 0.22f * submersion
+                    * (1.0f - smoothstep(0.08f, 0.34f, bodyRim)));
             }
 
             const float impactAge = t - motion.z;
@@ -897,16 +1065,15 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
                 // Ripple rings stay at the point where the body entered the water.
                 // Using the body's live position here made old rings follow its bounce.
                 const float2 impactDelta = float2(x - impactOrigin.x, z - impactOrigin.z);
-                const float impactDistance = length(impactDelta);
+                const float impactDistanceRoot = sqrt(max(dot(impactDelta, impactDelta), 0.0f) + 0.0004f);
+                const float impactDistance = impactDistanceRoot - 0.02f;
                 const float phase = 4.6f * impactDistance - 7.2f * impactAge;
                 const float decay = exp(-0.27f * impactDistance - 0.92f * impactAge);
                 const float amplitude = 0.23f * impactStrength * decay;
                 waveHeight += amplitude * sin(phase);
-                if (impactDistance > 1.0e-4f) {
-                    const float radialDerivative = amplitude
-                        * (4.6f * cos(phase) - 0.27f * sin(phase));
-                    waveGradient += radialDerivative * (impactDelta / impactDistance);
-                }
+                const float radialDerivative = amplitude
+                    * (4.6f * cos(phase) - 0.27f * sin(phase));
+                waveGradient += radialDerivative * (impactDelta / impactDistanceRoot);
                 const float ringDistance = abs(impactDistance - radius * 0.8f - 1.8f * impactAge);
                 impactFoam = max(impactFoam, impactStrength * exp(-2.0f * impactAge)
                     * (1.0f - smoothstep(0.04f, 0.22f, ringDistance)));
@@ -914,16 +1081,18 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
 
             // Vertical bobbing drives smaller continuous waves between discrete entries.
             // The derivative is analytic so normals remain consistent with the height.
+            const float bodyDistanceRoot = sqrt(max(dot(delta, delta), 0.0f) + 0.0004f);
+            const float smoothBodyDistance = bodyDistanceRoot - 0.02f;
             const float bobEnergy = submersion * saturate(abs(verticalVelocity) * 0.25f);
-            if (bobEnergy > 0.01f && distanceToBody > 1.0e-4f) {
-                const float bobPhase = 4.0f * distanceToBody - 2.8f * t
+            if (bobEnergy > 0.01f) {
+                const float bobPhase = 4.0f * smoothBodyDistance - 2.8f * t
                     + (verticalVelocity < 0.0f ? 0.0f : 3.14159265f);
-                const float bobEnvelope = exp(-0.5f * distanceToBody);
+                const float bobEnvelope = exp(-0.5f * smoothBodyDistance);
                 const float bobAmplitude = 0.10f * bobEnergy * bobEnvelope;
                 waveHeight += bobAmplitude * sin(bobPhase);
                 const float radialBobDerivative = bobAmplitude
                     * (4.0f * cos(bobPhase) - 0.5f * sin(bobPhase));
-                waveGradient += radialBobDerivative * (delta / distanceToBody);
+                waveGradient += radialBobDerivative * (delta / bodyDistanceRoot);
             }
 
             const float2 horizontalVelocity = motion.xy;
@@ -933,12 +1102,13 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
                 const float2 side = float2(-forward.y, forward.x);
                 const float along = dot(delta, forward);
                 const float across = dot(delta, side);
-                const float wakeEnvelope = exp(-max(-along, 0.0f) * 0.22f - abs(across) * 0.48f);
+                const float smoothAbsAcross = sqrt(across * across + 0.0004f) - 0.02f;
+                const float wakeEnvelope = exp(-max(-along, 0.0f) * 0.22f - smoothAbsAcross * 0.48f);
                 const float wakePhase = 1.45f * along + 2.8f * across - 1.3f * t;
                 const float wakeAmplitude = 0.10f * saturate(horizontalSpeed * 0.16f);
                 waveHeight += wakeAmplitude * wakeEnvelope * sin(wakePhase);
                 const float envelopeAlongDerivative = along < 0.0f ? 0.22f : 0.0f;
-                const float envelopeAcrossDerivative = across < 0.0f ? 0.48f : -0.48f;
+                const float envelopeAcrossDerivative = -0.48f * across / sqrt(across * across + 0.0004f);
                 const float derivativeAlong = wakeAmplitude * wakeEnvelope
                     * (envelopeAlongDerivative * sin(wakePhase) + 1.45f * cos(wakePhase));
                 const float derivativeAcross = wakeAmplitude * wakeEnvelope
@@ -1011,10 +1181,11 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
             if (g_SceneCB.enableRayTracedReflections > 0.5f && reflectionDirection.y > 0.015f) {
                 RayDesc reflectionRay;
                 reflectionRay.Origin = hitPos + worldNormal * 0.025f;
-                // Keep the secondary origin outside the flat DXR proxy. The
-                // analytic waves affect shading; moving this origin below the
-                // proxy caused self-intersection bands in the reflection.
-                reflectionRay.Origin.y = max(reflectionRay.Origin.y, hitPos.y + 0.03f);
+                // The BLAS broad phase remains at mean Y=0 even though this hit
+                // is corrected onto the displaced surface. Start above both
+                // representations so the reflection ray cannot self-hit the
+                // flat proxy when a trough lies below its mean plane.
+                reflectionRay.Origin.y = max(hitPos.y, 0.0f) + 0.03f;
                 reflectionRay.Direction = reflectionDirection;
                 reflectionRay.TMin = 0.01f;
                 reflectionRay.TMax = 1000.0f;
@@ -1030,7 +1201,6 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
                 reflectionPayload.sampleStream = payload.sampleStream | 0x80000000u;
                 TraceRay(g_Scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, reflectionRay, reflectionPayload);
                 reflectionColor = reflectionPayload.color;
-                payload.sampleStream = reflectionPayload.sampleStream & 0x3fffffffu;
             }
             const float nDotV = saturate(dot(worldNormal, V));
             const float fresnel = 0.02f + 0.98f * pow(1.0f - nDotV, 5.0f);
@@ -1055,12 +1225,12 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
             const float3 foamColor = float3(0.56f, 0.70f, 0.74f);
             payload.color = lerp(deepWater, max(reflectionColor, 0.0f), fresnel)
                 + waterSpecular
-                + foamColor * max(foam * 0.22f, impactFoam * 0.32f);
+                + foamColor * max(foam * 0.22f, impactFoam * 0.62f);
         }
         payload.albedo = albedo;
         payload.normal = worldNormal;
         payload.hitPos = hitPos;
-        payload.hitT = RayTCurrent();
+        payload.hitT = waterRayT;
         payload.roughness = mat.roughness;
         return;
     }
@@ -1083,33 +1253,33 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
 
     const float3 viewFresnel = fresnelSchlick(saturate(dot(worldNormal, V)), F0);
     const float maxViewFresnel = max(viewFresnel.r, max(viewFresnel.g, viewFresnel.b));
+    const uint reflectionSampleIndex = payload.sampleStream & 0x00ffffffu;
+    // Use randomized systematic half-rate sampling: the per-pixel hash chooses
+    // which sample-index parity is traced, so each consecutive pair contributes
+    // one reflection ray. Weighting by 1/p (p=0.5) preserves the estimator mean
+    // across the complementary Owen-scrambled Sobol subsequences.
+    const bool traceReflectionThisSample = ((payload.sampleSeed ^ reflectionSampleIndex) & 1u) == 0u;
     const bool reflectionIsSignificant =
         (metallic > 0.15f && roughness < 0.70f) ||
-        (roughness < 0.42f && maxViewFresnel > 0.055f);
+        // Polished dielectrics have only ~4% normal-incidence F0. Do not
+        // suppress their physically valid reflection ray at normal view angles.
+        (roughness < 0.42f && maxViewFresnel > 0.0f);
     float3 tracedReflection = 0.0f;
     if (g_SceneCB.renderMode <= 1u && (payload.sampleStream & 0x40000000u) != 0u &&
         g_SceneCB.enableRayTracedReflections > 0.5f &&
+        traceReflectionThisSample &&
         reflectionIsSignificant) {
-        // Sample the isotropic GGX NDF. The returned reflected radiance is
-        // weighted by f * cos(theta) / pdf, where pdf_L = D(N.H) * N.H / (4 V.H).
+        // Sample the isotropic GGX visible-normal distribution (VNDF). Its
+        // reflected-direction PDF is D(H) G1(V) / (4 N.V), so the Cook-Torrance
+        // throughput simplifies exactly to F * G1(L). This avoids wasting
+        // samples below the macro-surface and reduces rough-stone reflection noise.
         // Keep reflection randomness in its own Sobol dimensions so enabling
         // reflections does not perturb the primary ray's shadow/GI samples.
         uint reflectionSampleStream = (payload.sampleStream & 0xc0ffffffu) | (16u << 24u);
         const float u1 = sampleSobol2D(reflectionSampleStream, payload.sampleSeed);
         const float u2 = sampleSobol2D(reflectionSampleStream, payload.sampleSeed);
         const float alpha = max(roughness * roughness, 0.0025f);
-        const float alpha2 = alpha * alpha;
-        const float phi = 2.0f * PI * u1;
-        const float cosTheta = sqrt(saturate((1.0f - u2) /
-            max(1.0f + (alpha2 - 1.0f) * u2, 1.0e-6f)));
-        const float sinTheta = sqrt(max(1.0f - cosTheta * cosTheta, 0.0f));
-        const float3 up = abs(worldNormal.y) < 0.999f
-            ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-        const float3 tangent = safeNormalize(cross(up, worldNormal), float3(1.0f, 0.0f, 0.0f));
-        const float3 bitangent = cross(worldNormal, tangent);
-        const float3 microNormal = safeNormalize(
-            tangent * (sinTheta * cos(phi)) + bitangent * (sinTheta * sin(phi)) + worldNormal * cosTheta,
-            worldNormal);
+        const float3 microNormal = sampleGGXVisibleNormal(worldNormal, V, alpha, float2(u1, u2));
         const float nDotVReflect = saturate(dot(worldNormal, V));
         const float nDotHReflect = saturate(dot(worldNormal, microNormal));
         const float vDotHReflect = saturate(dot(V, microNormal));
@@ -1136,11 +1306,9 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
             reflectionPayload.sampleStream = reflectionSampleStream | 0x80000000u;
             TraceRay(g_Scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, reflectionRay, reflectionPayload);
 
-            const float geometry = geometrySmith(worldNormal, V, reflectionDirection, roughness);
             const float3 fresnel = fresnelSchlick(vDotHReflect, F0);
-            const float brdfOverPdf = geometry * vDotHReflect /
-                max(nDotVReflect * nDotHReflect, 1.0e-5f);
-            tracedReflection = max(reflectionPayload.color, 0.0f) * fresnel * brdfOverPdf;
+            const float brdfOverPdf = smithGGXG1(nDotLReflect, alpha);
+            tracedReflection = max(reflectionPayload.color, 0.0f) * fresnel * brdfOverPdf * 2.0f;
         }
     }
 

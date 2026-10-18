@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cctype>
+#include <map>
 
 namespace Engine {
 
@@ -222,8 +223,11 @@ void EditorUI::renderSceneHierarchy(Scene& scene) {
         }
         std::string nameLower = ent.name.name;
         for (char& c : nameLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        std::string pathLower = ent.sourceNodePath;
+        for (char& c : pathLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         const std::string idText = std::to_string(ent.id);
-        if (nameLower.find(filterLower) != std::string::npos || idText.find(filterLower) != std::string::npos) {
+        if (nameLower.find(filterLower) != std::string::npos || pathLower.find(filterLower) != std::string::npos ||
+            idText.find(filterLower) != std::string::npos) {
             visibleEntities.push_back(&ent);
         }
     }
@@ -249,19 +253,31 @@ void EditorUI::renderSceneHierarchy(Scene& scene) {
     ImGui::BeginChild("EntityTreeScroll");
     selectedId = scene.getSelectedEntityId();
     uint32_t visibleCount = 0;
-
+    std::map<std::string, std::vector<const SceneEntity*>> assetGroups;
     for (const SceneEntity* ent : visibleEntities) {
-        ++visibleCount;
-        bool isSelected = (selectedId == ent->id);
-        const std::string label = ent->name.name + "  |  " + std::to_string(ent->mesh.indexCount / 3) + " tris  |  #" + std::to_string(ent->id);
-        ImGui::PushID(static_cast<int>(ent->id));
-        if (ImGui::Selectable(label.c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
-            scene.setSelectedEntityId(ent->id);
+        const std::string group = ent->sourceNodePath.empty() ? "Scene Entities" : ent->sourceNodePath;
+        assetGroups[group].push_back(ent);
+    }
+    for (const auto& [groupPath, groupEntities] : assetGroups) {
+        const bool grouped = groupPath != "Scene Entities";
+        const bool open = !grouped || ImGui::TreeNodeEx(groupPath.c_str(),
+            ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth);
+        if (!open) continue;
+        for (const SceneEntity* ent : groupEntities) {
+            ++visibleCount;
+            const bool isSelected = (selectedId == ent->id);
+            const std::string label = ent->name.name + "  |  " +
+                std::to_string(ent->mesh.indexCount / 3) + " tris  |  #" + std::to_string(ent->id);
+            ImGui::PushID(static_cast<int>(ent->id));
+            if (ImGui::Selectable(label.c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns)) {
+                scene.setSelectedEntityId(ent->id);
+            }
+            ImGui::PopID();
         }
-        ImGui::PopID();
+        if (grouped) ImGui::TreePop();
     }
     ImGui::EndChild();
-    ImGui::TextDisabled("Showing %u / %u | Search by name or ID", visibleCount, static_cast<unsigned>(entities.size()));
+    ImGui::TextDisabled("Showing %u / %u | Search asset path, name or ID", visibleCount, static_cast<unsigned>(entities.size()));
 
     ImGui::End();
 }

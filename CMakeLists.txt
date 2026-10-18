@@ -218,6 +218,15 @@ if(BUILD_TESTING)
         target_compile_options(EngineMathTests PRIVATE /W3 /EHsc /utf-8)
     endif()
     add_test(NAME EngineMathChecks COMMAND EngineMathTests)
+
+    add_executable(EngineGltfImportTests tests/GltfImportTests.cpp)
+    target_include_directories(EngineGltfImportTests PRIVATE src vendor/cgltf)
+    target_compile_definitions(EngineGltfImportTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+    if(MSVC)
+        target_compile_options(EngineGltfImportTests PRIVATE /W3 /EHsc /utf-8)
+    endif()
+    add_test(NAME EngineGltfImportChecks
+        COMMAND EngineGltfImportTests "${CMAKE_CURRENT_SOURCE_DIR}/assets/khronos/MetalRoughSpheresNoTextures.glb")
 endif()
 
 add_custom_command(TARGET CustomEngine POST_BUILD

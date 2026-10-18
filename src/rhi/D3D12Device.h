@@ -20,6 +20,7 @@ using Microsoft::WRL::ComPtr;
 class D3D12Device {
 public:
     static constexpr uint32_t FRAME_COUNT = 2;
+    static constexpr uint32_t SRV_UAV_DESCRIPTOR_CAPACITY = 1024;
 
     D3D12Device() = default;
     ~D3D12Device();
@@ -30,7 +31,7 @@ public:
     void waitForGpu();
     void moveToNextFrame();
 
-    void resize(uint32_t width, uint32_t height);
+    bool resize(uint32_t width, uint32_t height);
 
     ID3D12Device5* getDevice() const { return m_device.Get(); }
     ID3D12CommandQueue* getCommandQueue() const { return m_commandQueue.Get(); }

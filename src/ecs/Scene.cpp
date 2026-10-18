@@ -8,6 +8,7 @@
 #include <assimp/GltfMaterial.h>
 #include "Scene.h"
 #include "OceanWave.h"
+#include "GltfImportMath.h"
 #include "../core/Window.h"
 #include <iostream>
 #include <cmath>
@@ -17,6 +18,10 @@
 #include <array>
 #include <limits>
 #include <filesystem>
+#include <functional>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Engine {
 
@@ -24,20 +29,87 @@ static inline uint64_t alignTo(uint64_t size, uint64_t alignment) {
     return (size + alignment - 1) & ~(alignment - 1);
 }
 
-SceneEntity* Scene::getEntity(EntityID id) {
-    for (auto& e : m_entities) {
-        if (e.id == id) return &e;
+static std::vector<uint8_t> findMissingSourceMetallicRoughnessMaps(
+    const std::string& gltfPath, size_t materialCount) {
+    std::vector<uint8_t> missing(materialCount, 0);
+    cgltf_options options = {};
+    cgltf_data* rawData = nullptr;
+    if (cgltf_parse_file(&options, gltfPath.c_str(), &rawData) != cgltf_result_success || !rawData) {
+        return missing;
     }
-    return nullptr;
+    std::unique_ptr<cgltf_data, decltype(&cgltf_free)> data(rawData, &cgltf_free);
+    const std::filesystem::path assetDirectory = std::filesystem::path(gltfPath).parent_path();
+    const size_t count = std::min(materialCount, static_cast<size_t>(data->materials_count));
+    for (size_t i = 0; i < count; ++i) {
+        const cgltf_material& material = data->materials[i];
+        if (!material.has_pbr_metallic_roughness) continue;
+        const cgltf_texture* texture = material.pbr_metallic_roughness.metallic_roughness_texture.texture;
+        if (!texture) continue;
+        const cgltf_image* image = texture->image;
+        if (!image && texture->has_basisu) image = texture->basisu_image;
+        if (!image && texture->has_webp) image = texture->webp_image;
+        if (!image || !image->uri || image->uri[0] == '\0' || std::string_view(image->uri).rfind("data:", 0) == 0) {
+            missing[i] = 1;
+            continue;
+        }
+        std::string uri(image->uri);
+        cgltf_decode_uri(uri.data());
+        std::filesystem::path imagePath(uri);
+        if (imagePath.is_relative()) imagePath = assetDirectory / imagePath;
+        std::error_code fileError;
+        missing[i] = !std::filesystem::is_regular_file(imagePath.lexically_normal(), fileError) || fileError;
+    }
+    return missing;
+}
+
+static bool getBundledSponzaReflectionFallback(uint32_t materialId, float& roughness, const char*& role) {
+    // The Khronos glTF sample does not include the 24 referenced metallic/roughness
+    // images. Preserve a dielectric stone response and make the floor and structural
+    // column surfaces explicitly polished limestone so their DXR returns are visible.
+    switch (materialId) {
+    case 9:  roughness = 0.18f; role = "floor"; return true;
+    case 1:  roughness = 0.18f; role = "pillar-base"; return true;
+    case 8:  roughness = 0.18f; role = "pillar-shaft"; return true;
+    default: return false;
+    }
+}
+
+SceneEntity* Scene::getEntity(EntityID id) {
+    const auto index = m_entityIndex.find(id);
+    return index && *index < m_entities.size() && m_entities[*index].id == id
+        ? &m_entities[*index] : nullptr;
+}
+
+void Scene::setSelectedEntityId(EntityID id) {
+    m_selectedEntityId = (id == NULL_ENTITY || getEntity(id)) ? id : NULL_ENTITY;
+}
+
+bool Scene::rebuildEntityIndex() {
+    std::vector<EntityID> ids;
+    ids.reserve(m_entities.size());
+    for (const SceneEntity& entity : m_entities) ids.push_back(entity.id);
+    if (!m_entityIndex.rebuild(ids)) {
+        std::cerr << "[ECS Error] Scene has a null or duplicate EntityID; indexed lookup was not updated.\n";
+        return false;
+    }
+    return true;
 }
 
 bool Scene::updateEntityMaterial(EntityID id) {
-    const auto entityIt = std::find_if(m_entities.begin(), m_entities.end(), [id](const SceneEntity& entity) {
-        return entity.id == id;
-    });
-    if (entityIt == m_entities.end()) return false;
+    const auto entityIndexLookup = m_entityIndex.find(id);
+    if (!entityIndexLookup || *entityIndexLookup >= m_entities.size()) return false;
+    const size_t entityIndex = *entityIndexLookup;
+    const SceneEntity& entity = m_entities[entityIndex];
 
-    const size_t entityIndex = static_cast<size_t>(std::distance(m_entities.begin(), entityIt));
+    const MaterialComponent& edited = entity.material;
+    if (!std::isfinite(edited.baseColor.x) || !std::isfinite(edited.baseColor.y) ||
+        !std::isfinite(edited.baseColor.z) || !std::isfinite(edited.baseColor.w) ||
+        !std::isfinite(edited.metallic) || !std::isfinite(edited.roughness) ||
+        !std::isfinite(edited.emissive)) {
+        std::cerr << "[Scene Error] Refused non-finite material edit for entity '"
+                  << entity.name.name << "'.\n";
+        return false;
+    }
     if (entityIndex >= m_allInstances.size()) return false;
 
     InstanceData& instance = m_allInstances[entityIndex];
@@ -54,11 +126,10 @@ bool Scene::updateEntityMaterial(EntityID id) {
     }
 
     MaterialData& material = m_allMaterials[instance.materialId];
-    material.baseColor = XMFLOAT4(entityIt->material.baseColor.x, entityIt->material.baseColor.y,
-        entityIt->material.baseColor.z, entityIt->material.baseColor.w);
-    material.metallic = std::clamp(entityIt->material.metallic, 0.0f, 1.0f);
-    material.roughness = std::clamp(entityIt->material.roughness, 0.04f, 1.0f);
-    material.emissive = std::max(entityIt->material.emissive, 0.0f);
+    material.baseColor = XMFLOAT4(edited.baseColor.x, edited.baseColor.y, edited.baseColor.z, edited.baseColor.w);
+    material.metallic = std::clamp(edited.metallic, 0.0f, 1.0f);
+    material.roughness = std::clamp(edited.roughness, 0.04f, 1.0f);
+    material.emissive = std::max(edited.emissive, 0.0f);
     // Keep imported texture IDs, alpha cutoff, and flags on the selected override.
     m_materialsDirty = true;
     ++m_queuedMaterialEdits;
@@ -107,55 +178,167 @@ bool Scene::init(D3D12Device& device, const std::string& gltfPath) {
     m_loadedSourceAsset = loaded;
     if (!loaded || m_entities.empty()) {
         std::cout << "[Scene] Fallback: Building architectural procedural Sponza Atrium..." << std::endl;
+        m_allVertices.clear();
+        m_allIndices.clear();
+        m_allMaterials.clear();
+        m_allInstances.clear();
+        m_entities.clear();
+        m_entityIndex.clear();
+        m_nextEntityId = 1;
         buildProceduralSponza(m_allVertices, m_allIndices);
+        if (!createTextureArray(device, {}, {})) return false;
     }
 
     return uploadGpuScene(device);
 }
 
 bool Scene::uploadGpuScene(D3D12Device& device) {
-    if (m_allVertices.empty() || m_allIndices.empty() || m_allMaterials.empty() || m_allInstances.empty()) return false;
+    if (!rebuildEntityIndex()) return false;
+    if (m_allVertices.empty() || m_allIndices.empty() || m_allMaterials.empty() || m_allInstances.empty() ||
+        m_entities.size() != m_allInstances.size() || m_entities.size() > std::numeric_limits<uint32_t>::max() ||
+        m_allMaterials.size() > std::numeric_limits<uint32_t>::max() ||
+        m_allIndices.size() % 3 != 0 || m_allVertices.size() > std::numeric_limits<uint32_t>::max() ||
+        m_allIndices.size() > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "[Scene Error] Scene arrays violate entity/instance or 32-bit DXR layout invariants.\n";
+        return false;
+    }
+    for (size_t entityIndex = 0; entityIndex < m_entities.size(); ++entityIndex) {
+        const SceneEntity& entity = m_entities[entityIndex];
+        const InstanceData& instance = m_allInstances[entityIndex];
+        if (entity.mesh.vertexCount < 3 || entity.mesh.indexCount < 3 || entity.mesh.indexCount % 3 != 0 ||
+            entity.mesh.vertexOffset > m_allVertices.size() ||
+            entity.mesh.vertexCount > m_allVertices.size() - entity.mesh.vertexOffset ||
+            entity.mesh.indexOffset > m_allIndices.size() ||
+            entity.mesh.indexCount > m_allIndices.size() - entity.mesh.indexOffset ||
+            instance.materialId >= m_allMaterials.size() ||
+            instance.vertexOffset != entity.mesh.vertexOffset || instance.indexOffset != entity.mesh.indexOffset) {
+            std::cerr << "[Scene Error] Invalid draw range or instance/material mapping for entity '"
+                      << entity.name.name << "'.\n";
+            return false;
+        }
+        const float transformValues[] = {
+            entity.transform.position.x, entity.transform.position.y, entity.transform.position.z,
+            entity.transform.rotation.x, entity.transform.rotation.y, entity.transform.rotation.z,
+            entity.transform.scale.x, entity.transform.scale.y, entity.transform.scale.z
+        };
+        for (float value : transformValues) {
+            if (!std::isfinite(value)) {
+                std::cerr << "[Scene Error] Non-finite transform for entity '" << entity.name.name << "'.\n";
+                return false;
+            }
+        }
+        if (std::abs(entity.transform.scale.x) <= 1.0e-8f ||
+            std::abs(entity.transform.scale.y) <= 1.0e-8f ||
+            std::abs(entity.transform.scale.z) <= 1.0e-8f) {
+            std::cerr << "[Scene Error] Singular transform scale for entity '" << entity.name.name << "'.\n";
+            return false;
+        }
+        for (size_t i = entity.mesh.indexOffset; i < static_cast<size_t>(entity.mesh.indexOffset) + entity.mesh.indexCount; ++i) {
+            if (m_allIndices[i] >= entity.mesh.vertexCount) {
+                std::cerr << "[Scene Error] Index " << m_allIndices[i] << " exceeds entity-local vertex count for '"
+                          << entity.name.name << "'.\n";
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0; i < m_allVertices.size(); ++i) {
+        const Vertex& vertex = m_allVertices[i];
+        const float values[] = { vertex.position.x, vertex.position.y, vertex.position.z,
+            vertex.normal.x, vertex.normal.y, vertex.normal.z, vertex.uv.x, vertex.uv.y };
+        for (float value : values) {
+            if (!std::isfinite(value)) {
+                std::cerr << "[Scene Error] Non-finite vertex attribute at global vertex " << i << ".\n";
+                return false;
+            }
+        }
+    }
+    for (size_t i = 0; i < m_allMaterials.size(); ++i) {
+        const MaterialData& material = m_allMaterials[i];
+        const float values[] = { material.baseColor.x, material.baseColor.y, material.baseColor.z,
+            material.baseColor.w, material.metallic, material.roughness, material.emissive,
+            material.alphaCutoff };
+        for (float value : values) {
+            if (!std::isfinite(value)) {
+                std::cerr << "[Scene Error] Non-finite GPU material value at material " << i << ".\n";
+                return false;
+            }
+        }
+        if (material.textureId < -1 || material.metallicRoughnessTextureId < -1) {
+            std::cerr << "[Scene Error] Invalid negative texture layer at material " << i << ".\n";
+            return false;
+        }
+    }
     m_totalTriangles = static_cast<uint32_t>(m_allIndices.size() / 3);
     const uint64_t vbSize = sizeof(Vertex) * m_allVertices.size();
     m_vertexBuffer = device.createBuffer(vbSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
     if (!m_vertexBuffer) return false;
     void* mapped = nullptr;
-    if (FAILED(m_vertexBuffer->Map(0, nullptr, &mapped))) return false;
+    if (FAILED(m_vertexBuffer->Map(0, nullptr, &mapped)) || !mapped) {
+        std::cerr << "[Scene Error] Failed to map vertex upload storage.\n";
+        return false;
+    }
     std::memcpy(mapped, m_allVertices.data(), vbSize);
     m_vertexBuffer->Unmap(0, nullptr);
 
     const uint64_t ibSize = sizeof(uint32_t) * m_allIndices.size();
     m_indexBuffer = device.createBuffer(ibSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (!m_indexBuffer || FAILED(m_indexBuffer->Map(0, nullptr, &mapped))) return false;
+    if (!m_indexBuffer || FAILED(m_indexBuffer->Map(0, nullptr, &mapped)) || !mapped) {
+        std::cerr << "[Scene Error] Failed to allocate or map index upload storage.\n";
+        return false;
+    }
     std::memcpy(mapped, m_allIndices.data(), ibSize);
     m_indexBuffer->Unmap(0, nullptr);
 
     m_materialBufferCapacity = m_allMaterials.size() + m_entities.size();
     const uint64_t matSize = sizeof(MaterialData) * m_materialBufferCapacity;
     m_materialBuffer = device.createBuffer(matSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (!m_materialBuffer || FAILED(m_materialBuffer->Map(0, nullptr, &mapped))) return false;
+    if (!m_materialBuffer || FAILED(m_materialBuffer->Map(0, nullptr, &mapped)) || !mapped) {
+        std::cerr << "[Scene Error] Failed to allocate or map material upload storage.\n";
+        return false;
+    }
     std::memcpy(mapped, m_allMaterials.data(), sizeof(MaterialData) * m_allMaterials.size());
     m_materialBuffer->Unmap(0, nullptr);
 
     const uint64_t instSize = sizeof(InstanceData) * m_allInstances.size();
     m_instanceBuffer = device.createBuffer(instSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (!m_instanceBuffer || FAILED(m_instanceBuffer->Map(0, nullptr, &mapped))) return false;
+    if (!m_instanceBuffer || FAILED(m_instanceBuffer->Map(0, nullptr, &mapped)) || !mapped) {
+        std::cerr << "[Scene Error] Failed to allocate or map instance upload storage.\n";
+        return false;
+    }
     std::memcpy(mapped, m_allInstances.data(), instSize);
     m_instanceBuffer->Unmap(0, nullptr);
 
     const uint64_t cbSize = alignTo(sizeof(SceneCB), 256);
-    m_sceneCb = device.createBuffer(cbSize, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
-    if (!m_sceneCb) return false;
+    for (uint32_t frameIndex = 0; frameIndex < D3D12Device::FRAME_COUNT; ++frameIndex) {
+        m_sceneCb[frameIndex] = device.createBuffer(cbSize, D3D12_HEAP_TYPE_UPLOAD,
+                                                   D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!m_sceneCb[frameIndex]) {
+            std::cerr << "[Scene Error] Failed to allocate SceneCB upload buffer for frame "
+                      << frameIndex << ".\n";
+            return false;
+        }
+    }
 
     device.beginFrame();
     m_blases.resize(m_entities.size());
     for (size_t i = 0; i < m_entities.size(); ++i) {
         auto& ent = m_entities[i];
+        if (i >= m_allInstances.size() || ent.mesh.indexCount == 0 || ent.mesh.indexCount % 3 != 0) {
+            std::cerr << "[Scene Error] Entity '" << ent.name.name << "' has no valid triangle instance data.\n";
+            device.endFrame();
+            device.waitForGpu();
+            return false;
+        }
         const bool isOpaque = i >= m_allInstances.size() || m_allInstances[i].materialId >= m_allMaterials.size()
             || m_allMaterials[m_allInstances[i].materialId].alphaCutoff <= 0.0f;
-        m_blases[i].build(device, m_vertexBuffer.Get(), static_cast<uint64_t>(ent.mesh.vertexOffset) * sizeof(Vertex),
+        if (!m_blases[i].build(device, m_vertexBuffer.Get(), static_cast<uint64_t>(ent.mesh.vertexOffset) * sizeof(Vertex),
             ent.mesh.vertexCount, sizeof(Vertex), m_indexBuffer.Get(),
-            static_cast<uint64_t>(ent.mesh.indexOffset) * sizeof(uint32_t), ent.mesh.indexCount, isOpaque);
+            static_cast<uint64_t>(ent.mesh.indexOffset) * sizeof(uint32_t), ent.mesh.indexCount, isOpaque)) {
+            std::cerr << "[Scene Error] BLAS build validation/allocation failed for entity '" << ent.name.name << "'.\n";
+            device.endFrame();
+            device.waitForGpu();
+            return false;
+        }
         ent.mesh.blasIndex = static_cast<uint32_t>(i);
     }
 
@@ -164,12 +347,23 @@ bool Scene::uploadGpuScene(D3D12Device& device) {
     for (size_t i = 0; i < m_entities.size(); ++i) {
         Tlas::Instance inst = {};
         inst.blasGpuAddress = m_blases[i].getGpuAddress();
+        if (inst.blasGpuAddress == 0) {
+            std::cerr << "[Scene Error] BLAS GPU address is null for entity '" << m_entities[i].name.name << "'.\n";
+            device.endFrame();
+            device.waitForGpu();
+            return false;
+        }
         m_entities[i].transform.get3x4RowMajor(inst.transform);
         inst.instanceId = static_cast<uint32_t>(i);
         inst.hitGroupIndex = 0;
         tlasInstances.push_back(inst);
     }
-    m_tlas.build(device, tlasInstances);
+    if (!m_tlas.build(device, tlasInstances)) {
+        std::cerr << "[Scene Error] TLAS build validation/allocation failed for " << tlasInstances.size() << " instances.\n";
+        device.endFrame();
+        device.waitForGpu();
+        return false;
+    }
     device.endFrame();
     device.waitForGpu();
     return true;
@@ -177,6 +371,9 @@ bool Scene::uploadGpuScene(D3D12Device& device) {
 
 bool Scene::initOcean(D3D12Device& device) {
     m_isOceanScene = true;
+    m_oceanImpactCount = 0;
+    m_oceanEntryCrossingCount = 0;
+    m_oceanExitCrossingCount = 0;
     m_camera.position = Vec3(0.0f, 4.8f, -12.5f);
     m_camera.yaw = 90.0f;
     m_camera.pitch = -4.0f;
@@ -232,6 +429,7 @@ bool Scene::initOcean(D3D12Device& device) {
 
         SceneEntity ent;
         ent.id = m_nextEntityId++;
+        ent.sourceNodePath = "Ocean";
         ent.name.name = name;
         ent.transform.position = position;
         ent.material.baseColor = Vec4(m_allMaterials[materialId].baseColor.x, m_allMaterials[materialId].baseColor.y,
@@ -366,18 +564,34 @@ bool Scene::initOcean(D3D12Device& device) {
     for (size_t i = 0; i < floatEntityIndices.size(); ++i) {
         const auto& ent = m_entities[floatEntityIndices[i]];
         const Vec3 h = floats[i].half;
-        const int32_t body = m_joltWorld->addBox(ent.transform.position.x, ent.transform.position.y, ent.transform.position.z,
-            h.x, h.y, h.z, 1.9f);
+        const int32_t body = floats[i].buoy
+            ? m_joltWorld->addEllipsoid(ent.transform.position.x, ent.transform.position.y, ent.transform.position.z,
+                                        h.x, h.y, h.z, 1.9f)
+            : m_joltWorld->addBox(ent.transform.position.x, ent.transform.position.y, ent.transform.position.z,
+                                  h.x, h.y, h.z, 1.9f);
         if (body < 0) return false;
         m_floatBodyIndices.push_back(body);
         m_initialFloatHeights.push_back(ent.transform.position.y);
-        m_oceanBodyHalfHeights.push_back(h.y);
-        m_oceanBodyRadii.push_back(std::max(0.35f, std::sqrt(h.x * h.x + h.z * h.z) * 0.70f));
+        m_oceanBodyHalfExtents.push_back(h);
+        m_oceanBodyIsEllipsoid.push_back(floats[i].buoy);
+        m_oceanBodyRadii.push_back(std::sqrt(h.x * h.z));
         const OceanWaveSample initialWave = evaluateOceanWave(ent.transform.position.x, ent.transform.position.z, m_oceanTime);
         m_oceanPreviousBottomClearance.push_back(ent.transform.position.y - h.y - initialWave.height);
         m_oceanImpactTimes.push_back(-1000.0f);
         m_oceanImpactStrengths.push_back(0.0f);
         m_oceanImpactPositions.push_back(ent.transform.position);
+        const size_t bodySlot = m_oceanBodyRadii.size() - 1;
+        const OceanBodyWaveState bodyState{ent.transform.position.x, ent.transform.position.y,
+            ent.transform.position.z, m_oceanBodyRadii[bodySlot], h.y, 0.0f, 0.0f, 0.0f};
+        const float wetness = oceanBodySubmersion(initialWave, bodyState);
+        m_sceneCbData.oceanBodyPositionRadius[bodySlot] = XMFLOAT4(
+            ent.transform.position.x, ent.transform.position.y, ent.transform.position.z,
+            m_oceanBodyRadii[bodySlot]);
+        m_sceneCbData.oceanBodyVelocityImpact[bodySlot] = XMFLOAT4(0.0f, 0.0f, -1000.0f, 0.0f);
+        m_sceneCbData.oceanBodyImpactPositionRadius[bodySlot] = XMFLOAT4(
+            ent.transform.position.x, initialWave.height, ent.transform.position.z,
+            m_oceanBodyRadii[bodySlot]);
+        m_sceneCbData.oceanBodyVerticalState[bodySlot] = XMFLOAT4(0.0f, h.y, wetness, 0.0f);
     }
     m_sceneCbData.oceanBodyCount = static_cast<uint32_t>(std::min<size_t>(m_floatBodyIndices.size(), 8));
     std::cout << "[Scene] Ocean scene ready: Jolt bodies=" << m_joltWorld->bodyCount()
@@ -434,11 +648,25 @@ bool Scene::initReflectionLab(D3D12Device& device, const std::string& gltfPath) 
     // diameter is about 0.01 units). Normalize only this lab scene so imported
     // assets fill the viewport and have useful camera near/far precision.
     const float unitScale = std::clamp(8.0f / sourceDiameter, 1.0e-4f, 1.0e4f);
-    for (SceneEntity& entity : m_entities) {
-        entity.transform.position = sourceCenter + (entity.transform.position - sourceCenter) * unitScale;
-        entity.transform.scale = entity.transform.scale * unitScale;
+    for (Vertex& vertex : m_allVertices) {
+        vertex.position.x = sourceCenter.x + (vertex.position.x - sourceCenter.x) * unitScale;
+        vertex.position.y = sourceCenter.y + (vertex.position.y - sourceCenter.y) * unitScale;
+        vertex.position.z = sourceCenter.z + (vertex.position.z - sourceCenter.z) * unitScale;
     }
-    m_transformsDirty = true;
+    for (SceneEntity& entity : m_entities) {
+        entity.transform.position = Vec3(0.0f);
+        entity.transform.rotation = Vec3(0.0f);
+        entity.transform.scale = Vec3(1.0f);
+        AABB normalizedBounds;
+        const size_t vertexBegin = entity.mesh.vertexOffset;
+        const size_t vertexEnd = vertexBegin + entity.mesh.vertexCount;
+        if (vertexEnd > m_allVertices.size()) return false;
+        for (size_t i = vertexBegin; i < vertexEnd; ++i) {
+            const XMFLOAT3& p = m_allVertices[i].position;
+            normalizedBounds.expand(Vec3(p.x, p.y, p.z));
+        }
+        entity.mesh.localAABB = normalizedBounds;
+    }
 
     const Vec3 center = sourceCenter;
     const float radius = std::max(sourceDiameter * unitScale * 0.5f, 0.5f);
@@ -468,7 +696,7 @@ bool Scene::initReflectionLab(D3D12Device& device, const std::string& gltfPath) 
     m_sceneCbData.sunColor = XMFLOAT4(m_sun.color.x, m_sun.color.y, m_sun.color.z, 1.0f);
     m_isReflectionLabScene = true;
     m_isOceanScene = false;
-    if (!createTextureArray(device, {}, {}) || !uploadGpuScene(device)) return false;
+    if (!uploadGpuScene(device)) return false;
     resetAccumulation();
     float minRoughness = 1.0f, maxRoughness = 0.0f, maxMetallic = 0.0f;
     for (const MaterialData& material : m_allMaterials) {
@@ -485,6 +713,15 @@ bool Scene::initReflectionLab(D3D12Device& device, const std::string& gltfPath) 
 
 bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::string>& textureUris,
                                const std::vector<uint8_t>& srgbLayers) {
+    ID3D12Device5* d3dDevice = device.getDevice();
+    if (!d3dDevice) {
+        std::cerr << "[Scene Error] Cannot create the texture array because D3D12 is not initialized.\n";
+        return false;
+    }
+    if (textureUris.size() > D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION) {
+        std::cerr << "[Scene Error] Texture array exceeds the D3D12 layer limit.\n";
+        return false;
+    }
     if (!textureUris.empty() && srgbLayers.size() != textureUris.size()) {
         std::cerr << "[Scene Error] Texture color-space metadata does not match texture-array layer count.\n";
         return false;
@@ -536,8 +773,12 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
     texDesc.SampleDesc.Count = 1;
     texDesc.SampleDesc.Quality = 0;
     texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    device.getDevice()->GetCopyableFootprints(&texDesc, 0, subresourceCount, 0,
-                                               footprints.data(), numRows.data(), rowSizes.data(), &totalUploadSize);
+    d3dDevice->GetCopyableFootprints(&texDesc, 0, subresourceCount, 0,
+                                     footprints.data(), numRows.data(), rowSizes.data(), &totalUploadSize);
+    if (totalUploadSize == 0) {
+        std::cerr << "[Scene Error] D3D12 returned an empty texture upload layout.\n";
+        return false;
+    }
 
     D3D12_HEAP_PROPERTIES defaultHeap = {};
     defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -563,7 +804,12 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
 
     uint8_t* mappedUpload = nullptr;
     D3D12_RANGE readRange = { 0, 0 };
-    uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mappedUpload));
+    const HRESULT mapResult = uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mappedUpload));
+    if (FAILED(mapResult) || !mappedUpload) {
+        std::cerr << "[Scene Error] Could not map the texture-array upload buffer (HRESULT 0x"
+                  << std::hex << mapResult << std::dec << ").\n";
+        return false;
+    }
 
     for (UINT layer = 0; layer < arraySize; ++layer) {
         const bool srgbLayer = layer < srgbLayers.size() && srgbLayers[layer] != 0;
@@ -586,8 +832,11 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
                             const int x1 = std::min(x0 + 1, w - 1);
                             const float fx = sourceX - x0;
                             const int dst = (y * texWidth + x) * 4;
-                            const int samples[4] = { (y0 * w + x0) * 4, (y0 * w + x1) * 4,
-                                                     (y1 * w + x0) * 4, (y1 * w + x1) * 4 };
+                            const size_t samples[4] = {
+                                (static_cast<size_t>(y0) * static_cast<size_t>(w) + static_cast<size_t>(x0)) * 4,
+                                (static_cast<size_t>(y0) * static_cast<size_t>(w) + static_cast<size_t>(x1)) * 4,
+                                (static_cast<size_t>(y1) * static_cast<size_t>(w) + static_cast<size_t>(x0)) * 4,
+                                (static_cast<size_t>(y1) * static_cast<size_t>(w) + static_cast<size_t>(x1)) * 4};
                             const float weights[4] = { (1.0f - fx) * (1.0f - fy), fx * (1.0f - fy),
                                                        (1.0f - fx) * fy, fx * fy };
                             for (int channel = 0; channel < 3; ++channel) {
@@ -607,6 +856,9 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
                     }
                 }
                 stbi_image_free(pixels);
+            } else {
+                std::cerr << "[Scene Warning] Image decode failed for texture layer " << layer << " ('"
+                          << textureUris[layer] << "'): " << stbi_failure_reason() << "; using white fallback.\n";
             }
         }
 
@@ -690,6 +942,7 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
     srvDesc.Texture2DArray.ArraySize = arraySize;
 
     m_textureArraySrvIndex = device.allocateSrvUavDescriptor();
+    if (m_textureArraySrvIndex == std::numeric_limits<uint32_t>::max()) return false;
     device.getDevice()->CreateShaderResourceView(
         m_textureArray.Get(),
         &srvDesc,
@@ -715,12 +968,30 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
     m_allMaterials.clear();
     m_allInstances.clear();
     m_entities.clear();
+    m_entityIndex.clear();
 
     // 1. Collect materials and texture paths
     std::vector<std::string> texturePaths;
     std::vector<uint8_t> srgbTextureLayers;
     uint32_t missingMetallicRoughnessMaps = 0;
     const bool isBundledSponza = std::filesystem::path(path).filename() == "Sponza.gltf";
+    const std::vector<uint8_t> missingSourceMetallicRoughnessMaps = isBundledSponza
+        ? findMissingSourceMetallicRoughnessMaps(path, scene->mNumMaterials)
+        : std::vector<uint8_t>{};
+    const std::filesystem::path assetDirectory = std::filesystem::path(path).parent_path();
+    const auto resolveAssimpTexture = [&assetDirectory](const std::string& uri) {
+        const std::filesystem::path source(uri);
+        return (source.is_absolute() ? source : assetDirectory / source).lexically_normal().string();
+    };
+    if (scene->mNumMaterials == 0) {
+        MaterialData defaultMaterial = {};
+        defaultMaterial.baseColor = XMFLOAT4(0.85f, 0.85f, 0.85f, 1.0f);
+        defaultMaterial.metallic = 0.0f;
+        defaultMaterial.roughness = 0.5f;
+        defaultMaterial.textureId = -1;
+        defaultMaterial.metallicRoughnessTextureId = -1;
+        m_allMaterials.push_back(defaultMaterial);
+    }
     for (unsigned int i = 0; i < scene->mNumMaterials; ++i) {
         const aiMaterial* mat = scene->mMaterials[i];
         MaterialData md = {};
@@ -747,11 +1018,15 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
         if (mat->GetTexture(aiTextureType_BASE_COLOR, 0, &texPath) == AI_SUCCESS ||
             mat->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
             std::string uri = texPath.C_Str();
-            std::string fullPath = "assets/sponza/" + uri;
-            md.textureId = static_cast<int>(texturePaths.size());
-            texturePaths.push_back(fullPath);
-            srgbTextureLayers.push_back(1);
-            md.baseColor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+            const std::string fullPath = resolveAssimpTexture(uri);
+            if (std::filesystem::exists(fullPath)) {
+                md.textureId = static_cast<int>(texturePaths.size());
+                texturePaths.push_back(fullPath);
+                srgbTextureLayers.push_back(1);
+                md.baseColor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+            } else {
+                std::cerr << "[Scene Warning] Assimp base-color texture not found: " << fullPath << ".\n";
+            }
 
             // Foliage / Cutout detection
             if (uri.find(".png") != std::string::npos && uri != "white.png") {
@@ -759,29 +1034,29 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
             }
         }
         if (mat->GetTexture(aiTextureType_GLTF_METALLIC_ROUGHNESS, 0, &texPath) == AI_SUCCESS) {
-            const std::string metallicRoughnessPath = "assets/sponza/" + std::string(texPath.C_Str());
+            const std::string metallicRoughnessPath = resolveAssimpTexture(texPath.C_Str());
             if (std::filesystem::exists(metallicRoughnessPath)) {
                 md.metallicRoughnessTextureId = static_cast<int>(texturePaths.size());
                 texturePaths.push_back(metallicRoughnessPath);
                 srgbTextureLayers.push_back(0);
-            } else {
-                // A white placeholder for a missing glTF metallic/roughness map
-                // multiplies default factor 1/1 into a fully metallic, fully
-                // rough material. That suppresses diffuse color and incorrectly
-                // removes most surfaces from the specular-reflection path. Use
-                // a conservative dielectric fallback until the source map exists.
-                md.metallic = 0.0f;
-                // In this bundled Sponza glTF, material 9 is the large,
-                // horizontal stone floor (the source primitive spans the
-                // atrium at y=-2.506 with upward-facing normals). Give only
-                // that missing-map surface a polished-stone fallback so the
-                // existing single-ray reflection path can show floor returns
-                // without tracing every rough banner and masonry pixel.
-                md.roughness = isBundledSponza && i == 9 ? 0.30f : 0.65f;
-                ++missingMetallicRoughnessMaps;
-                std::cerr << "[Scene Warning] Missing metallic/roughness map '" << metallicRoughnessPath
-                          << "'; using dielectric fallback (metallic=0, roughness=" << md.roughness << ").\n";
             }
+        }
+        // Assimp omits glTF texture slots when the referenced image is absent, so
+        // GetTexture() can fail before the old missing-file branch is reached.
+        // Read the source glTF material references and apply the fallback in either
+        // case; do not silently leave the glTF default (metallic=1, roughness=1).
+        if (isBundledSponza && i < missingSourceMetallicRoughnessMaps.size() &&
+            missingSourceMetallicRoughnessMaps[i] && md.metallicRoughnessTextureId < 0) {
+            md.metallic = 0.0f;
+            md.roughness = 0.65f;
+            const char* role = "dielectric-stone";
+            float reflectionRoughness = md.roughness;
+            if (getBundledSponzaReflectionFallback(i, reflectionRoughness, role)) {
+                md.roughness = reflectionRoughness;
+                std::cout << "[DXR Sponza Material] id=" << i << " surface=" << role
+                          << " metallic=0 roughness=" << md.roughness << ".\n";
+            }
+            ++missingMetallicRoughnessMaps;
         }
         m_allMaterials.push_back(md);
     }
@@ -834,6 +1109,7 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
 
         SceneEntity ent;
         ent.id = m_nextEntityId++;
+        ent.sourceNodePath = "Sponza meshes";
         ent.name.name = mesh->mName.length > 0 ? mesh->mName.C_Str() : ("Sponza_Submesh_" + std::to_string(ent.id));
         ent.transform.position = Vec3(0.0f, 0.0f, 0.0f);
         ent.transform.scale = Vec3(1.0f, 1.0f, 1.0f);
@@ -841,7 +1117,7 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
         ent.mesh.vertexOffset = vOffset;
         ent.mesh.vertexCount = mesh->mNumVertices;
         ent.mesh.indexOffset = iOffset;
-        ent.mesh.indexCount = mesh->mNumFaces * 3;
+        ent.mesh.indexCount = static_cast<uint32_t>(m_allIndices.size() - iOffset);
         ent.mesh.localAABB = localAABB;
 
         ent.material.baseColor = Vec4(m_allMaterials[matId].baseColor.x, m_allMaterials[matId].baseColor.y, m_allMaterials[matId].baseColor.z, 1.0f);
@@ -875,13 +1151,21 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
 
 bool Scene::loadGltf(D3D12Device& device, const std::string& path) {
     cgltf_options options = {};
-    cgltf_data* data = nullptr;
-    cgltf_result result = cgltf_parse_file(&options, path.c_str(), &data);
-    if (result != cgltf_result_success) return false;
-
-    result = cgltf_load_buffers(&options, data, path.c_str());
-    if (result != cgltf_result_success) {
-        cgltf_free(data);
+    cgltf_data* rawData = nullptr;
+    const cgltf_result parseResult = cgltf_parse_file(&options, path.c_str(), &rawData);
+    if (parseResult != cgltf_result_success || !rawData) {
+        std::cerr << "[glTF Error] Parse failed for '" << path << "' (result " << parseResult << ").\n";
+        return false;
+    }
+    std::unique_ptr<cgltf_data, decltype(&cgltf_free)> data(rawData, &cgltf_free);
+    const cgltf_result bufferResult = cgltf_load_buffers(&options, data.get(), path.c_str());
+    if (bufferResult != cgltf_result_success) {
+        std::cerr << "[glTF Error] Buffer load failed for '" << path << "' (result " << bufferResult << ").\n";
+        return false;
+    }
+    const cgltf_result validationResult = cgltf_validate(data.get());
+    if (validationResult != cgltf_result_success) {
+        std::cerr << "[glTF Error] Validation failed for '" << path << "' (result " << validationResult << ").\n";
         return false;
     }
 
@@ -890,205 +1174,335 @@ bool Scene::loadGltf(D3D12Device& device, const std::string& path) {
     m_allMaterials.clear();
     m_allInstances.clear();
     m_entities.clear();
+    m_entityIndex.clear();
+    m_nextEntityId = 1;
 
-    // Map materials
+    std::vector<std::string> texturePaths;
+    std::vector<uint8_t> srgbTextureLayers;
+    std::unordered_map<std::string, int> textureLayerByKey;
+    const std::filesystem::path assetDirectory = std::filesystem::path(path).parent_path();
+    auto addExternalTexture = [&](const cgltf_texture_view& view, bool srgb) -> int {
+        const cgltf_texture* texture = view.texture;
+        const cgltf_image* image = texture ? texture->image : nullptr;
+        if (!image && texture) image = texture->basisu_image ? texture->basisu_image : texture->webp_image;
+        if (!image) return -1;
+        if (!image->uri || image->uri[0] == '\0') {
+            if (image->buffer_view) {
+                std::cerr << "[glTF Warning] Embedded buffer-view texture is not supported yet; material factor fallback used.\n";
+            }
+            return -1;
+        }
+        std::string uri = image->uri;
+        if (uri.rfind("data:", 0) == 0) {
+            std::cerr << "[glTF Warning] Embedded data-URI texture is not supported yet; material factor fallback used.\n";
+            return -1;
+        }
+        cgltf_decode_uri(uri.data());
+        std::filesystem::path imagePath(uri);
+        if (imagePath.is_relative()) imagePath = assetDirectory / imagePath;
+        imagePath = imagePath.lexically_normal();
+        std::error_code fileError;
+        if (!std::filesystem::is_regular_file(imagePath, fileError) || fileError) {
+            std::cerr << "[glTF Warning] Texture image not found: " << imagePath.string() << ".\n";
+            return -1;
+        }
+        const std::string key = imagePath.string() + (srgb ? "|srgb" : "|linear");
+        const auto existing = textureLayerByKey.find(key);
+        if (existing != textureLayerByKey.end()) return existing->second;
+        if (texturePaths.size() >= std::numeric_limits<uint16_t>::max()) {
+            std::cerr << "[glTF Error] Texture array exceeds the D3D12 array-layer limit.\n";
+            return -1;
+        }
+        const int layer = static_cast<int>(texturePaths.size());
+        texturePaths.push_back(imagePath.string());
+        srgbTextureLayers.push_back(srgb ? 1u : 0u);
+        textureLayerByKey.emplace(key, layer);
+        return layer;
+    };
+
+    MaterialData defaultMaterial = {};
+    defaultMaterial.baseColor = XMFLOAT4(0.85f, 0.85f, 0.85f, 1.0f);
+    defaultMaterial.metallic = 0.0f;
+    defaultMaterial.roughness = 0.5f;
+    defaultMaterial.textureId = -1;
+    defaultMaterial.metallicRoughnessTextureId = -1;
+    m_allMaterials.push_back(defaultMaterial);
+
     for (cgltf_size i = 0; i < data->materials_count; ++i) {
-        const auto& mat = data->materials[i];
-        MaterialData md = {};
-        md.textureId = -1;
-        md.metallicRoughnessTextureId = -1;
-        if (mat.has_pbr_metallic_roughness) {
-            md.baseColor = XMFLOAT4(
-                mat.pbr_metallic_roughness.base_color_factor[0],
-                mat.pbr_metallic_roughness.base_color_factor[1],
-                mat.pbr_metallic_roughness.base_color_factor[2],
-                mat.pbr_metallic_roughness.base_color_factor[3]
-            );
-            md.metallic = mat.pbr_metallic_roughness.metallic_factor;
-            md.roughness = mat.pbr_metallic_roughness.roughness_factor;
-
-            // Sample texture colors if available
-            if (mat.pbr_metallic_roughness.base_color_texture.texture &&
-                mat.pbr_metallic_roughness.base_color_texture.texture->image &&
-                mat.pbr_metallic_roughness.base_color_texture.texture->image->uri) {
-                std::string uri = mat.pbr_metallic_roughness.base_color_texture.texture->image->uri;
-                std::string fullPath = "assets/sponza/" + uri;
-                int imgW = 0, imgH = 0, imgComp = 0;
-                unsigned char* pixels = stbi_load(fullPath.c_str(), &imgW, &imgH, &imgComp, 3);
-                if (pixels && imgW > 0 && imgH > 0) {
-                    uint64_t sumR = 0, sumG = 0, sumB = 0;
-                    int totalPixels = imgW * imgH;
-                    int step = std::max(1, totalPixels / 4096);
-                    int samples = 0;
-                    for (int p = 0; p < totalPixels; p += step) {
-                        sumR += pixels[p * 3 + 0];
-                        sumG += pixels[p * 3 + 1];
-                        sumB += pixels[p * 3 + 2];
-                        samples++;
-                    }
-                    if (samples > 0) {
-                        float r = (sumR / (float)samples) / 255.0f;
-                        float g = (sumG / (float)samples) / 255.0f;
-                        float b = (sumB / (float)samples) / 255.0f;
-                        // Linearize sRGB to linear PBR space
-                        r = std::pow(r, 2.2f);
-                        g = std::pow(g, 2.2f);
-                        b = std::pow(b, 2.2f);
-                        md.baseColor = XMFLOAT4(r, g, b, 1.0f);
-                    }
-                    stbi_image_free(pixels);
-                }
-            }
+        const cgltf_material& material = data->materials[i];
+        MaterialData imported = {};
+        imported.baseColor = XMFLOAT4(0.85f, 0.85f, 0.85f, 1.0f);
+        imported.metallic = 1.0f;
+        imported.roughness = 1.0f;
+        imported.textureId = -1;
+        imported.metallicRoughnessTextureId = -1;
+        if (material.has_pbr_metallic_roughness) {
+            const auto& pbr = material.pbr_metallic_roughness;
+            imported.baseColor = XMFLOAT4(pbr.base_color_factor[0], pbr.base_color_factor[1],
+                                           pbr.base_color_factor[2], pbr.base_color_factor[3]);
+            imported.metallic = pbr.metallic_factor;
+            imported.roughness = pbr.roughness_factor;
+            imported.textureId = addExternalTexture(pbr.base_color_texture, true);
+            imported.metallicRoughnessTextureId = addExternalTexture(pbr.metallic_roughness_texture, false);
         } else {
-            md.baseColor = XMFLOAT4(0.85f, 0.85f, 0.85f, 1.0f);
-            md.metallic = 0.0f;
-            md.roughness = 0.5f;
+            imported.metallic = 0.0f;
+            imported.roughness = 0.5f;
         }
-        md.emissive = mat.emissive_factor[0] > 0.0f ? 2.0f : 0.0f;
-        m_allMaterials.push_back(md);
+        imported.baseColor.x = std::isfinite(imported.baseColor.x) ? std::clamp(imported.baseColor.x, 0.0f, 1.0f) : 0.85f;
+        imported.baseColor.y = std::isfinite(imported.baseColor.y) ? std::clamp(imported.baseColor.y, 0.0f, 1.0f) : 0.85f;
+        imported.baseColor.z = std::isfinite(imported.baseColor.z) ? std::clamp(imported.baseColor.z, 0.0f, 1.0f) : 0.85f;
+        imported.baseColor.w = std::isfinite(imported.baseColor.w) ? std::clamp(imported.baseColor.w, 0.0f, 1.0f) : 1.0f;
+        imported.metallic = std::isfinite(imported.metallic) ? std::clamp(imported.metallic, 0.0f, 1.0f) : 0.0f;
+        imported.roughness = std::isfinite(imported.roughness) ? std::clamp(imported.roughness, 0.04f, 1.0f) : 0.5f;
+        const float emissive = std::max({material.emissive_factor[0], material.emissive_factor[1],
+                                         material.emissive_factor[2]});
+        imported.emissive = std::isfinite(emissive) ? std::max(emissive, 0.0f) : 0.0f;
+        if (material.alpha_mode == cgltf_alpha_mode_mask) {
+            imported.alphaCutoff = std::isfinite(material.alpha_cutoff)
+                ? std::clamp(material.alpha_cutoff, 0.0f, 1.0f) : 0.5f;
+        } else if (material.alpha_mode == cgltf_alpha_mode_blend) {
+            std::cerr << "[glTF Warning] BLEND transparency is not implemented; material '" << (material.name ? material.name : "(unnamed)")
+                      << "' is rendered opaque.\n";
+        }
+        m_allMaterials.push_back(imported);
     }
 
-    if (m_allMaterials.empty()) {
-        MaterialData def = {};
-        def.baseColor = XMFLOAT4(0.85f, 0.85f, 0.85f, 1.0f);
-        def.roughness = 0.5f;
-        def.textureId = -1;
-        def.metallicRoughnessTextureId = -1;
-        m_allMaterials.push_back(def);
-    }
-
-    // Traverse nodes / meshes
-    for (cgltf_size i = 0; i < data->nodes_count; ++i) {
-        const auto& node = data->nodes[i];
-        if (!node.mesh) continue;
-
-        for (cgltf_size p = 0; p < node.mesh->primitives_count; ++p) {
-            const auto& prim = node.mesh->primitives[p];
-            if (prim.type != cgltf_primitive_type_triangles) continue;
-
-            uint32_t vOffset = static_cast<uint32_t>(m_allVertices.size());
-            uint32_t iOffset = static_cast<uint32_t>(m_allIndices.size());
-
-            const float* posData = nullptr;
-            const float* normData = nullptr;
-            const float* uvData = nullptr;
-            cgltf_size numVerts = 0;
-
-            for (cgltf_size a = 0; a < prim.attributes_count; ++a) {
-                const auto& attr = prim.attributes[a];
-                const auto* acc = attr.data;
-                const uint8_t* buf = (const uint8_t*)acc->buffer_view->buffer->data + acc->buffer_view->offset + acc->offset;
-                if (attr.type == cgltf_attribute_type_position) {
-                    posData = (const float*)buf;
-                    numVerts = acc->count;
-                } else if (attr.type == cgltf_attribute_type_normal) {
-                    normData = (const float*)buf;
-                } else if (attr.type == cgltf_attribute_type_texcoord) {
-                    uvData = (const float*)buf;
+    std::unordered_set<const cgltf_node*> visitedNodes;
+    auto importNode = [&](const cgltf_node* root, const auto& visitSelf, const std::string& parentPath) -> void {
+        if (!root) return;
+        if (!visitedNodes.insert(root).second) {
+            std::cerr << "[glTF Warning] Repeated/cyclic scene node skipped: "
+                      << (root->name ? root->name : "(unnamed)") << ".\n";
+            return;
+        }
+        const std::string nodeName = root->name && root->name[0] != '\0'
+            ? root->name : ("node_" + std::to_string(static_cast<size_t>(root - data->nodes)));
+        const std::string nodePath = parentPath.empty() ? nodeName : parentPath + "/" + nodeName;
+        float worldMatrix[16] = {};
+        cgltf_node_transform_world(root, worldMatrix);
+        bool matrixFinite = true;
+        for (float value : worldMatrix) matrixFinite = matrixFinite && std::isfinite(value);
+        if (!matrixFinite) {
+            std::cerr << "[glTF Error] Non-finite world transform on node '"
+                      << (root->name ? root->name : "(unnamed)") << "'.\n";
+        } else if (root->mesh) {
+            for (cgltf_size primitiveIndex = 0; primitiveIndex < root->mesh->primitives_count; ++primitiveIndex) {
+                const cgltf_primitive& primitive = root->mesh->primitives[primitiveIndex];
+                if (primitive.type != cgltf_primitive_type_triangles) {
+                    std::cerr << "[glTF Warning] Skipped non-triangle primitive on node '"
+                              << (root->name ? root->name : "(unnamed)") << "'.\n";
+                    continue;
                 }
-            }
-
-            if (!posData || numVerts == 0) continue;
-
-            float sX = node.has_scale ? node.scale[0] : 1.0f;
-            float sY = node.has_scale ? node.scale[1] : 1.0f;
-            float sZ = node.has_scale ? node.scale[2] : 1.0f;
-
-            AABB localAABB;
-            for (cgltf_size v = 0; v < numVerts; ++v) {
-                Vertex vert = {};
-                vert.position = XMFLOAT3(posData[v * 3 + 0] * sX, posData[v * 3 + 1] * sY, posData[v * 3 + 2] * sZ);
-                if (normData) {
-                    vert.normal = XMFLOAT3(normData[v * 3 + 0], normData[v * 3 + 1], normData[v * 3 + 2]);
-                } else {
-                    vert.normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
+                const cgltf_accessor* positions = cgltf_find_accessor(&primitive, cgltf_attribute_type_position, 0);
+                const cgltf_accessor* normals = cgltf_find_accessor(&primitive, cgltf_attribute_type_normal, 0);
+                const cgltf_accessor* texcoords = cgltf_find_accessor(&primitive, cgltf_attribute_type_texcoord, 0);
+                if (!positions || positions->type != cgltf_type_vec3 || positions->count < 3 ||
+                    positions->count > std::numeric_limits<uint32_t>::max() ||
+                    (normals && (normals->type != cgltf_type_vec3 || normals->count != positions->count)) ||
+                    (texcoords && (texcoords->type != cgltf_type_vec2 || texcoords->count != positions->count))) {
+                    std::cerr << "[glTF Error] Invalid vertex accessor layout on node '"
+                              << (root->name ? root->name : "(unnamed)") << "'.\n";
+                    continue;
                 }
-                if (uvData) {
-                    vert.uv = XMFLOAT2(uvData[v * 2 + 0], uvData[v * 2 + 1]);
-                }
-                localAABB.expand(Vec3(vert.position.x, vert.position.y, vert.position.z));
-                m_allVertices.push_back(vert);
-            }
 
-            // Indices
-            uint32_t primIndexCount = 0;
-            if (prim.indices) {
-                const auto* acc = prim.indices;
-                primIndexCount = static_cast<uint32_t>(acc->count);
-                const uint8_t* buf = (const uint8_t*)acc->buffer_view->buffer->data + acc->buffer_view->offset + acc->offset;
-                for (cgltf_size idx = 0; idx < acc->count; ++idx) {
-                    uint32_t indexVal = 0;
-                    if (acc->component_type == cgltf_component_type_r_16u) {
-                        indexVal = ((const uint16_t*)buf)[idx];
-                    } else if (acc->component_type == cgltf_component_type_r_32u) {
-                        indexVal = ((const uint32_t*)buf)[idx];
-                    } else if (acc->component_type == cgltf_component_type_r_8u) {
-                        indexVal = ((const uint8_t*)buf)[idx];
+                std::vector<Vertex> localVertices(static_cast<size_t>(positions->count));
+                AABB localBounds;
+                bool primitiveValid = true;
+                for (cgltf_size vertexIndex = 0; vertexIndex < positions->count; ++vertexIndex) {
+                    cgltf_float sourcePosition[3] = {};
+                    if (!cgltf_accessor_read_float(positions, vertexIndex, sourcePosition, 3)) {
+                        primitiveValid = false;
+                        break;
                     }
-                    m_allIndices.push_back(indexVal);
+                    Vertex& vertex = localVertices[vertexIndex];
+                    float transformedPosition[3] = {};
+                    if (!transformGltfPosition(worldMatrix, sourcePosition, transformedPosition)) {
+                        primitiveValid = false;
+                        break;
+                    }
+                    vertex.position = XMFLOAT3(transformedPosition[0], transformedPosition[1], transformedPosition[2]);
+                    if (normals) {
+                        cgltf_float sourceNormal[3] = {};
+                        float transformedNormal[3] = {};
+                        if (!cgltf_accessor_read_float(normals, vertexIndex, sourceNormal, 3) ||
+                            !transformGltfNormal(worldMatrix, sourceNormal, transformedNormal)) {
+                            primitiveValid = false;
+                            break;
+                        }
+                        vertex.normal = XMFLOAT3(transformedNormal[0], transformedNormal[1], transformedNormal[2]);
+                    } else {
+                        vertex.normal = XMFLOAT3(0.0f, 0.0f, 0.0f);
+                    }
+                    if (texcoords) {
+                        cgltf_float uv[2] = {};
+                        if (!cgltf_accessor_read_float(texcoords, vertexIndex, uv, 2) ||
+                            !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
+                            primitiveValid = false;
+                            break;
+                        }
+                        vertex.uv = XMFLOAT2(uv[0], uv[1]);
+                    }
+                    localBounds.expand(Vec3(vertex.position.x, vertex.position.y, vertex.position.z));
                 }
+                if (!primitiveValid) {
+                    std::cerr << "[glTF Error] Could not decode/transform vertex data on node '"
+                              << (root->name ? root->name : "(unnamed)") << "'.\n";
+                    continue;
+                }
+
+                std::vector<uint32_t> localIndices;
+                if (primitive.indices) {
+                    const cgltf_accessor* indexAccessor = primitive.indices;
+                    if (indexAccessor->type != cgltf_type_scalar || indexAccessor->count < 3 ||
+                        indexAccessor->count % 3 != 0 ||
+                        indexAccessor->count > std::numeric_limits<uint32_t>::max()) {
+                        std::cerr << "[glTF Error] Invalid triangle index accessor on node '"
+                                  << (root->name ? root->name : "(unnamed)") << "'.\n";
+                        continue;
+                    }
+                    localIndices.reserve(static_cast<size_t>(indexAccessor->count));
+                    for (cgltf_size index = 0; index < indexAccessor->count; ++index) {
+                        const cgltf_size value = cgltf_accessor_read_index(indexAccessor, index);
+                        if (value >= positions->count) {
+                            primitiveValid = false;
+                            break;
+                        }
+                        localIndices.push_back(static_cast<uint32_t>(value));
+                    }
+                } else {
+                    if (positions->count % 3 != 0) {
+                        std::cerr << "[glTF Error] Non-indexed primitive vertex count is not divisible by three.\n";
+                        continue;
+                    }
+                    localIndices.reserve(static_cast<size_t>(positions->count));
+                    for (cgltf_size index = 0; index < positions->count; ++index)
+                        localIndices.push_back(static_cast<uint32_t>(index));
+                }
+                if (!primitiveValid || localIndices.size() < 3) {
+                    std::cerr << "[glTF Error] Invalid triangle index data on node '"
+                              << (root->name ? root->name : "(unnamed)") << "'.\n";
+                    continue;
+                }
+
+                if (!normals) {
+                    std::vector<Vec3> normalSums(localVertices.size(), Vec3(0.0f));
+                    for (size_t index = 0; index < localIndices.size(); index += 3) {
+                        const Vertex& a = localVertices[localIndices[index]];
+                        const Vertex& b = localVertices[localIndices[index + 1]];
+                        const Vertex& c = localVertices[localIndices[index + 2]];
+                        const Vec3 edge1 = Vec3(b.position.x - a.position.x, b.position.y - a.position.y, b.position.z - a.position.z);
+                        const Vec3 edge2 = Vec3(c.position.x - a.position.x, c.position.y - a.position.y, c.position.z - a.position.z);
+                        const Vec3 faceNormal = Vec3::cross(edge1, edge2);
+                        if (!std::isfinite(faceNormal.x) || !std::isfinite(faceNormal.y) || !std::isfinite(faceNormal.z)) {
+                            primitiveValid = false;
+                            break;
+                        }
+                        normalSums[localIndices[index]] += faceNormal;
+                        normalSums[localIndices[index + 1]] += faceNormal;
+                        normalSums[localIndices[index + 2]] += faceNormal;
+                    }
+                    if (!primitiveValid) continue;
+                    for (size_t i = 0; i < localVertices.size(); ++i) {
+                        const float lengthSquared = normalSums[i].lengthSq();
+                        if (std::isfinite(lengthSquared) && lengthSquared > 1.0e-20f) {
+                            const float invLength = 1.0f / std::sqrt(lengthSquared);
+                            localVertices[i].normal = XMFLOAT3(normalSums[i].x * invLength,
+                                                               normalSums[i].y * invLength,
+                                                               normalSums[i].z * invLength);
+                        } else {
+                            localVertices[i].normal = XMFLOAT3(0.0f, 1.0f, 0.0f);
+                        }
+                    }
+                }
+                if (m_allVertices.size() > std::numeric_limits<uint32_t>::max() - localVertices.size() ||
+                    m_allIndices.size() > std::numeric_limits<uint32_t>::max() - localIndices.size()) {
+                    std::cerr << "[glTF Error] Mesh data exceeds the engine's 32-bit draw/index offsets.\n";
+                    return;
+                }
+                const uint32_t vertexOffset = static_cast<uint32_t>(m_allVertices.size());
+                const uint32_t indexOffset = static_cast<uint32_t>(m_allIndices.size());
+                m_allVertices.insert(m_allVertices.end(), localVertices.begin(), localVertices.end());
+                m_allIndices.insert(m_allIndices.end(), localIndices.begin(), localIndices.end());
+
+                uint32_t materialIndex = 0;
+                if (primitive.material) {
+                    const cgltf_size resolvedIndex = cgltf_material_index(data.get(), primitive.material);
+                    if (resolvedIndex >= data->materials_count || resolvedIndex + 1 >= m_allMaterials.size()) {
+                        std::cerr << "[glTF Error] Primitive references a material outside the parsed material table.\n";
+                        m_allVertices.resize(vertexOffset);
+                        m_allIndices.resize(indexOffset);
+                        continue;
+                    }
+                    materialIndex = static_cast<uint32_t>(resolvedIndex + 1);
+                }
+                const MaterialData& material = m_allMaterials[materialIndex];
+                SceneEntity entity;
+                entity.id = m_nextEntityId++;
+                entity.sourceNodePath = nodePath;
+                entity.name.name = std::string(root->name ? root->name : "gltf_node") +
+                    "_primitive_" + std::to_string(primitiveIndex);
+                entity.transform.position = Vec3(0.0f);
+                entity.transform.rotation = Vec3(0.0f);
+                entity.transform.scale = Vec3(1.0f);
+                entity.material.baseColor = Vec4(material.baseColor.x, material.baseColor.y, material.baseColor.z, material.baseColor.w);
+                entity.material.metallic = material.metallic;
+                entity.material.roughness = material.roughness;
+                entity.mesh.vertexOffset = vertexOffset;
+                entity.mesh.vertexCount = static_cast<uint32_t>(localVertices.size());
+                entity.mesh.indexOffset = indexOffset;
+                entity.mesh.indexCount = static_cast<uint32_t>(localIndices.size());
+                entity.mesh.localAABB = localBounds;
+
+                InstanceData instance = {};
+                instance.materialId = materialIndex;
+                instance.vertexOffset = vertexOffset;
+                instance.indexOffset = indexOffset;
+                m_allInstances.push_back(instance);
+                m_entities.push_back(std::move(entity));
             }
+        }
+        for (cgltf_size childIndex = 0; childIndex < root->children_count; ++childIndex)
+            visitSelf(root->children[childIndex], visitSelf, nodePath);
+    };
 
-            // Create Entity
-            SceneEntity ent;
-            ent.id = m_nextEntityId++;
-            ent.name.name = node.name ? node.name : ("Sponza_Mesh_" + std::to_string(ent.id));
-
-            if (node.has_translation) {
-                ent.transform.position = Vec3(node.translation[0] * sX, node.translation[1] * sY, node.translation[2] * sZ);
-            }
-            ent.transform.scale = Vec3(1.0f, 1.0f, 1.0f);
-
-            ent.mesh.vertexOffset = vOffset;
-            ent.mesh.vertexCount = static_cast<uint32_t>(numVerts);
-            ent.mesh.indexOffset = iOffset;
-            ent.mesh.indexCount = primIndexCount;
-            ent.mesh.localAABB = localAABB;
-
-            uint32_t matId = 0;
-            if (prim.material) {
-                matId = static_cast<uint32_t>(prim.material - data->materials);
-            }
-            ent.material.baseColor = Vec4(m_allMaterials[matId].baseColor.x, m_allMaterials[matId].baseColor.y, m_allMaterials[matId].baseColor.z, 1.0f);
-            ent.material.metallic = m_allMaterials[matId].metallic;
-            ent.material.roughness = m_allMaterials[matId].roughness;
-
-            InstanceData instData = {};
-            instData.materialId = matId;
-            instData.vertexOffset = vOffset;
-            instData.indexOffset = iOffset;
-            m_allInstances.push_back(instData);
-
-            m_entities.push_back(ent);
+    if (data->scene) {
+        for (cgltf_size rootIndex = 0; rootIndex < data->scene->nodes_count; ++rootIndex)
+            importNode(data->scene->nodes[rootIndex], importNode, {});
+    } else {
+        for (cgltf_size nodeIndex = 0; nodeIndex < data->nodes_count; ++nodeIndex) {
+            const cgltf_node* node = &data->nodes[nodeIndex];
+            if (!node->parent) importNode(node, importNode, {});
         }
     }
-
-    cgltf_free(data);
-
-    // Compute scene bounds
-    AABB sceneBounds;
-    for (const auto& v : m_allVertices) {
-        sceneBounds.expand(Vec3(v.position.x, v.position.y, v.position.z));
+    if (m_entities.empty() || m_allVertices.empty() || m_allIndices.empty()) {
+        std::cerr << "[glTF Error] No valid triangle meshes were imported from '" << path << "'.\n";
+        return false;
     }
-    Vec3 sceneCenter = (sceneBounds.min + sceneBounds.max) * 0.5f;
+    if (!createTextureArray(device, texturePaths, srgbTextureLayers)) {
+        std::cerr << "[glTF Error] Could not create the imported texture array for '" << path << "'.\n";
+        return false;
+    }
 
-    // Position camera inside the Sponza central atrium corridor looking down +X
-    m_camera.position = Vec3(-6.0f, 2.0f, 0.0f);
-    m_camera.yaw = 0.0f; // looking down +X towards the other end of the atrium
-    m_camera.pitch = 2.0f; // looking slightly up at the grand two-story colonnade and atrium
+    AABB sceneBounds;
+    for (const Vertex& vertex : m_allVertices)
+        sceneBounds.expand(Vec3(vertex.position.x, vertex.position.y, vertex.position.z));
+    if (!std::isfinite(sceneBounds.min.x) || !std::isfinite(sceneBounds.max.x)) {
+        std::cerr << "[glTF Error] Imported scene bounds are invalid for '" << path << "'.\n";
+        return false;
+    }
+    const Vec3 sceneCenter = (sceneBounds.min + sceneBounds.max) * 0.5f;
+    m_camera.position = sceneCenter + Vec3(-6.0f, 2.0f, 0.0f);
+    m_camera.yaw = 0.0f;
+    m_camera.pitch = 2.0f;
     m_camera.fov = 65.0f;
     m_camera.moveSpeed = 6.0f;
     m_camera.lookSpeed = 0.15f;
 
-    std::cout << "[Scene] Successfully loaded glTF Sponza: " << m_entities.size() << " submeshes, " 
-              << m_allVertices.size() << " vertices, " << m_allIndices.size() / 3 << " triangles."
-              << " Bounds: X[" << sceneBounds.min.x << ", " << sceneBounds.max.x << "] "
-              << "Y[" << sceneBounds.min.y << ", " << sceneBounds.max.y << "] "
-              << "Z[" << sceneBounds.min.z << ", " << sceneBounds.max.z << "]"
-              << " Camera: (" << m_camera.position.x << ", " << m_camera.position.y << ", " << m_camera.position.z << ")" << std::endl;
-    return !m_entities.empty();
+    std::cout << "[Scene] Successfully imported glTF scene '" << path << "': "
+              << m_entities.size() << " mesh primitives, " << m_allVertices.size() << " vertices, "
+              << m_allIndices.size() / 3 << " triangles, " << m_allMaterials.size() << " materials.\n";
+    return true;
 }
-
 void Scene::buildProceduralSponza(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices) {
     auto addBox = [&](const Vec3& center, const Vec3& extents, const XMFLOAT4& color, float metallic, float roughness, const std::string& name) {
         uint32_t vStart = static_cast<uint32_t>(outVertices.size());
@@ -1096,14 +1510,14 @@ void Scene::buildProceduralSponza(std::vector<Vertex>& outVertices, std::vector<
 
         Vec3 h = extents * 0.5f;
         Vec3 p[8] = {
-            center + Vec3(-h.x, -h.y, -h.z),
-            center + Vec3( h.x, -h.y, -h.z),
-            center + Vec3( h.x,  h.y, -h.z),
-            center + Vec3(-h.x,  h.y, -h.z),
-            center + Vec3(-h.x, -h.y,  h.z),
-            center + Vec3( h.x, -h.y,  h.z),
-            center + Vec3( h.x,  h.y,  h.z),
-            center + Vec3(-h.x,  h.y,  h.z),
+            Vec3(-h.x, -h.y, -h.z),
+            Vec3( h.x, -h.y, -h.z),
+            Vec3( h.x,  h.y, -h.z),
+            Vec3(-h.x,  h.y, -h.z),
+            Vec3(-h.x, -h.y,  h.z),
+            Vec3( h.x, -h.y,  h.z),
+            Vec3( h.x,  h.y,  h.z),
+            Vec3(-h.x,  h.y,  h.z),
         };
 
         struct Face { int i0, i1, i2, i3; Vec3 n; };
@@ -1150,6 +1564,7 @@ void Scene::buildProceduralSponza(std::vector<Vertex>& outVertices, std::vector<
 
         SceneEntity ent;
         ent.id = m_nextEntityId++;
+        ent.sourceNodePath = "Procedural Sponza";
         ent.name.name = name;
         ent.transform.position = center;
         ent.material.baseColor = Vec4(color.x, color.y, color.z, color.w);
@@ -1216,35 +1631,42 @@ void Scene::buildProceduralSponza(std::vector<Vertex>& outVertices, std::vector<
     addBox(Vec3(0.0f, 1.8f, 0.0f), Vec3(1.2f, 1.6f, 1.2f), XMFLOAT4(0.95f, 0.85f, 0.45f, 1.0f), 0.9f, 0.15f, "Center_Gold_Statue");
 }
 
-void Scene::update(float dt, const Window& window, float viewportX, float viewportY, float viewportW, float viewportH, float renderAspect, uint32_t renderHeight) {
+void Scene::update(float dt, const Window& window, float viewportX, float viewportY, float viewportW,
+                   float viewportH, float renderAspect, uint32_t renderHeight, uint32_t frameIndex) {
+    m_sceneCbFrameIndex = frameIndex % D3D12Device::FRAME_COUNT;
     m_renderHeight = std::max(1u, renderHeight);
     m_frameCount++;
     if (renderAspect > 0.0f) {
         m_viewportAspect = renderAspect;
     }
 
-    // Camera movement
-    float speed = m_camera.moveSpeed;
-    if (window.isKeyDown(VK_SHIFT)) speed *= 2.5f;
+    // Keep A/B capture camera matrices identical even if the user moves the
+    // mouse or presses movement keys while the automated window is active.
+    if (!m_freezeSampleSeedForValidation) {
+        float speed = m_camera.moveSpeed;
+        if (window.isKeyDown(VK_SHIFT)) speed *= 2.5f;
 
-    Vec3 fwd = m_camera.getForward();
-    Vec3 right = m_camera.getRight();
-    Vec3 up = Vec3(0.0f, 1.0f, 0.0f);
+        const Vec3 fwd = m_camera.getForward();
+        const Vec3 right = m_camera.getRight();
+        const Vec3 up = Vec3(0.0f, 1.0f, 0.0f);
 
-    if (window.isKeyDown('W')) m_camera.position += fwd * speed * dt;
-    if (window.isKeyDown('S')) m_camera.position -= fwd * speed * dt;
-    if (window.isKeyDown('D')) m_camera.position += right * speed * dt;
-    if (window.isKeyDown('A')) m_camera.position -= right * speed * dt;
-    if (window.isKeyDown(VK_SPACE) || window.isKeyDown('E')) m_camera.position += up * speed * dt;
-    if (window.isKeyDown(VK_CONTROL) || window.isKeyDown('Q')) m_camera.position -= up * speed * dt;
+        if (window.isKeyDown('W')) m_camera.position += fwd * speed * dt;
+        if (window.isKeyDown('S')) m_camera.position -= fwd * speed * dt;
+        if (window.isKeyDown('D')) m_camera.position += right * speed * dt;
+        if (window.isKeyDown('A')) m_camera.position -= right * speed * dt;
+        if (window.isKeyDown(VK_SPACE) || window.isKeyDown('E')) m_camera.position += up * speed * dt;
+        if (window.isKeyDown(VK_CONTROL) || window.isKeyDown('Q')) m_camera.position -= up * speed * dt;
 
-    // Mouse look with Right Mouse Button
-    if (window.isMouseButtonDown(1)) {
-        Vec2 delta = window.getMouseDelta();
-        m_camera.yaw += delta.x * m_camera.lookSpeed;
-        m_camera.pitch -= delta.y * m_camera.lookSpeed;
-        m_camera.pitch = std::clamp(m_camera.pitch, -88.0f, 88.0f);
-        m_isLooking = true;
+        // Mouse look with Right Mouse Button
+        if (window.isMouseButtonDown(1)) {
+            const Vec2 delta = window.getMouseDelta();
+            m_camera.yaw += delta.x * m_camera.lookSpeed;
+            m_camera.pitch -= delta.y * m_camera.lookSpeed;
+            m_camera.pitch = std::clamp(m_camera.pitch, -88.0f, 88.0f);
+            m_isLooking = true;
+        } else {
+            m_isLooking = false;
+        }
     } else {
         m_isLooking = false;
     }
@@ -1261,7 +1683,17 @@ void Scene::update(float dt, const Window& window, float viewportX, float viewpo
     // disabled and keeps the conventional camera-motion reset behavior.
     const bool useNrdCameraReprojection = !m_isOceanScene &&
         m_sceneCbData.renderMode == 0 && m_sceneCbData.enableNRD != 0;
-    if (m_firstFrame || (m_cameraMoved && !useNrdCameraReprojection) || m_accumResetPending) {
+    if (m_freezeSampleSeedForValidation) {
+        // Each A/B state replays the same low-discrepancy sample sequence and
+        // accumulates it from a clean history. This reduces reflection variance
+        // without letting the on/off captures use different random samples.
+        if (m_firstFrame || m_accumResetPending) {
+            m_accumFrameCount = 1;
+            m_accumResetPending = false;
+        } else {
+            m_accumFrameCount = std::min(m_accumFrameCount + 1u, 256u);
+        }
+    } else if (m_firstFrame || (m_cameraMoved && !useNrdCameraReprojection) || m_accumResetPending) {
         m_accumFrameCount = 1;
         m_accumResetPending = false;
     } else {
@@ -1287,11 +1719,23 @@ void Scene::update(float dt, const Window& window, float viewportX, float viewpo
 void Scene::updateOceanPhysics(float dt) {
     if (!m_joltWorld || !m_joltWorld->isReady()) return;
     const float fixedStep = 1.0f / 60.0f;
-    m_oceanStepAccumulator += std::clamp(dt, 0.0f, 0.1f);
+    if (!std::isfinite(dt) || dt <= 0.0f) return;
+    const float maximumFrameInput = fixedStep * 4.0f;
+    const float admittedFrameTime = std::min(dt, maximumFrameInput);
+    m_oceanDroppedSimulationTime = std::min(std::numeric_limits<float>::max(),
+        m_oceanDroppedSimulationTime + (dt - admittedFrameTime));
+    m_oceanStepAccumulator = std::min(m_oceanStepAccumulator + admittedFrameTime, fixedStep * 5.0f);
     uint32_t steps = 0;
     while (m_oceanStepAccumulator >= fixedStep && steps < 4) {
-        m_oceanTime += fixedStep;
-        m_joltWorld->step(fixedStep, m_oceanTime);
+        const float nextSimulationTime = m_oceanTime + fixedStep;
+        if (!m_joltWorld->step(fixedStep, nextSimulationTime)) {
+            std::cerr << "[Ocean Error] Jolt fixed-step update failed; this frame's remaining physics time was discarded.\n";
+            m_oceanDroppedSimulationTime = std::min(std::numeric_limits<float>::max(),
+                m_oceanDroppedSimulationTime + m_oceanStepAccumulator);
+            m_oceanStepAccumulator = 0.0f;
+            break;
+        }
+        m_oceanTime = nextSimulationTime;
 
         // Detect entries after every physics substep. Checking only once per rendered
         // frame can miss a fast re-entry when the body rebounds between frames.
@@ -1306,12 +1750,32 @@ void Scene::updateOceanPhysics(float dt) {
             }
             if (!std::isfinite(position[1]) || !std::isfinite(velocity[1]) || !std::isfinite(surface[0])) continue;
 
-            const float halfHeight = i < m_oceanBodyHalfHeights.size() ? m_oceanBodyHalfHeights[i] : 0.0f;
-            const float bottomClearance = position[1] - halfHeight - surface[0];
+            if (i >= m_oceanBodyHalfExtents.size()) {
+                std::cerr << "[Ocean Error] Missing shape extents for Jolt body " << bodyIndex << ".\n";
+                continue;
+            }
+            const Vec3 halfExtents = m_oceanBodyHalfExtents[i];
+            float verticalSupport = 0.0f;
+            const bool isEllipsoid = i < m_oceanBodyIsEllipsoid.size() && m_oceanBodyIsEllipsoid[i];
+            const bool supportValid = isEllipsoid
+                ? tryGetOrientedEllipsoidVerticalHalfExtent(rotation, halfExtents.x, halfExtents.y,
+                                                             halfExtents.z, verticalSupport)
+                : tryGetOrientedBoxVerticalHalfExtent(rotation, halfExtents.x, halfExtents.y,
+                                                       halfExtents.z, verticalSupport);
+            if (!supportValid) {
+                std::cerr << "[Ocean Error] Invalid Jolt orientation/extents for body " << bodyIndex
+                          << "; skipping water-entry test for this substep.\n";
+                continue;
+            }
+            const float bottomClearance = position[1] - verticalSupport - surface[0];
             if (i >= m_oceanPreviousBottomClearance.size() || i >= m_oceanImpactTimes.size() ||
                 i >= m_oceanImpactStrengths.size() || i >= m_oceanImpactPositions.size()) continue;
             const float previousClearance = m_oceanPreviousBottomClearance[i];
-            if (previousClearance > 0.04f && bottomClearance <= 0.04f && velocity[1] < -0.45f) {
+            const bool crossedIntoWater = previousClearance > 0.04f && bottomClearance <= 0.04f;
+            const bool crossedOutOfWater = previousClearance <= 0.04f && bottomClearance > 0.04f;
+            if (crossedIntoWater) ++m_oceanEntryCrossingCount;
+            if (crossedOutOfWater) ++m_oceanExitCrossingCount;
+            if (crossedIntoWater && velocity[1] < -0.45f) {
                 const float strength = std::clamp(-velocity[1] / 5.0f, 0.25f, 1.0f);
                 m_oceanImpactTimes[i] = m_oceanTime;
                 m_oceanImpactStrengths[i] = strength;
@@ -1336,6 +1800,10 @@ void Scene::updateOceanPhysics(float dt) {
         if (!m_joltWorld->getTransform(static_cast<uint32_t>(m_floatBodyIndices[i]), position, rotation)) continue;
         float velocity[3] = {};
         if (!m_joltWorld->getLinearVelocity(static_cast<uint32_t>(m_floatBodyIndices[i]), velocity)) continue;
+        if (i + 1 >= m_entities.size()) {
+            std::cerr << "[Ocean Error] Jolt body has no corresponding ECS entity (slot " << i << ").\n";
+            continue;
+        }
         SceneEntity& ent = m_entities[i + 1]; // Entity zero is the ocean plane.
         ent.transform.position = Vec3(position[0], position[1], position[2]);
         m_oceanMinBodyY = std::min(m_oceanMinBodyY, position[1]);
@@ -1359,7 +1827,31 @@ void Scene::updateOceanPhysics(float dt) {
             m_sceneCbData.oceanBodyImpactPositionRadius[bodySlot] = XMFLOAT4(
                 impactPosition.x, impactPosition.y, impactPosition.z,
                 bodySlot < m_oceanBodyRadii.size() ? m_oceanBodyRadii[bodySlot] : 0.5f);
-            m_sceneCbData.oceanBodyVerticalState[bodySlot] = XMFLOAT4(velocity[1], 0.0f, 0.0f, 0.0f);
+            if (bodySlot >= m_oceanBodyHalfExtents.size()) {
+                std::cerr << "[Ocean Error] Missing shape extent for GPU body slot " << bodySlot << ".\n";
+                continue;
+            }
+            const Vec3 halfExtents = m_oceanBodyHalfExtents[bodySlot];
+            float verticalSupport = 0.0f;
+            const bool isEllipsoid = bodySlot < m_oceanBodyIsEllipsoid.size() && m_oceanBodyIsEllipsoid[bodySlot];
+            const bool supportValid = isEllipsoid
+                ? tryGetOrientedEllipsoidVerticalHalfExtent(rotation, halfExtents.x, halfExtents.y,
+                                                            halfExtents.z, verticalSupport)
+                : tryGetOrientedBoxVerticalHalfExtent(rotation, halfExtents.x, halfExtents.y,
+                                                       halfExtents.z, verticalSupport);
+            if (!supportValid) {
+                std::cerr << "[Ocean Error] Could not derive GPU body support for slot " << bodySlot << ".\n";
+                continue;
+            }
+            const OceanBodyWaveState bodyState{position[0], position[1], position[2],
+                bodySlot < m_oceanBodyRadii.size() ? m_oceanBodyRadii[bodySlot] : 0.5f,
+                verticalSupport, velocity[0], velocity[1], velocity[2]};
+            // Match the body displacement field's CPU/GPU amplitude: immersion
+            // is defined against the shared base wave. Jolt buoyancy itself
+            // samples impacts and neighboring body displacement as well.
+            const OceanWaveSample baseWater = evaluateOceanWave(position[0], position[2], m_oceanTime);
+            m_sceneCbData.oceanBodyVerticalState[bodySlot] = XMFLOAT4(
+                velocity[1], verticalSupport, oceanBodySubmersion(baseWater, bodyState), 0.0f);
         }
 
         XMFLOAT4 q(rotation[0], rotation[1], rotation[2], rotation[3]);
@@ -1495,8 +1987,12 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
             inst.hitGroupIndex = 0;
             tlasInstances.push_back(inst);
         }
-        m_tlas.build(device, tlasInstances);
-        m_transformsDirty = false;
+        if (m_tlas.build(device, tlasInstances)) {
+            m_transformsDirty = false;
+        } else {
+            std::cerr << "[Scene Error] TLAS update failed; transform changes remain pending for retry.\n";
+            return;
+        }
     }
 
     // 2. Update SceneCB
@@ -1519,7 +2015,12 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
     m_sceneCbData.sunDirection = XMFLOAT3(m_sun.direction.x, m_sun.direction.y, m_sun.direction.z);
     m_sceneCbData.sunIntensity = m_sun.intensity;
     m_sceneCbData.sunColor = XMFLOAT4(m_sun.color.x, m_sun.color.y, m_sun.color.z, 1.0f);
-    m_sceneCbData.frameCount = m_freezeSampleSeedForValidation ? 0u : m_frameCount;
+    if (m_freezeSampleSeedForValidation) {
+        m_sceneCbData.frameCount = m_validationSampleIndex;
+        m_validationSampleIndex = std::min(m_validationSampleIndex + 1u, 0x00ffffffu);
+    } else {
+        m_sceneCbData.frameCount = m_frameCount;
+    }
     m_sceneCbData.accumFrameCount = m_accumFrameCount;
     m_sceneCbData.renderHeight = m_renderHeight;
     m_sceneCbData.padPrev1 = m_oceanTime;
@@ -1554,7 +2055,9 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
     m_lastCameraYaw   = m_camera.yaw;
     m_lastCameraPitch = m_camera.pitch;
 
-    // Halton (2, 3) low-discrepancy sub-pixel jitter sequence (16 phases)
+    // Halton (2, 3) low-discrepancy sub-pixel jitter sequence (16 phases).
+    // Freeze every sampling input during A/B capture, including this field,
+    // so tests stay stable if antialiasing is enabled in a future capture path.
     static const float halton2[16] = {
         0.0f/1.0f, 1.0f/2.0f, 1.0f/4.0f, 3.0f/4.0f,
         1.0f/8.0f, 5.0f/8.0f, 3.0f/8.0f, 7.0f/8.0f,
@@ -1567,16 +2070,24 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
         8.0f/9.0f, 1.0f/27.0f, 4.0f/27.0f, 7.0f/27.0f,
         10.0f/27.0f, 13.0f/27.0f, 16.0f/27.0f, 19.0f/27.0f
     };
-    uint32_t phase = m_frameCount % 16;
-    m_sceneCbData.jitterOffset.x = (halton2[phase] - 0.5f);
-    m_sceneCbData.jitterOffset.y = (halton3[phase] - 0.5f);
+    if (m_freezeSampleSeedForValidation) {
+        m_sceneCbData.jitterOffset = XMFLOAT2(0.0f, 0.0f);
+    } else {
+        const uint32_t phase = m_frameCount % 16;
+        m_sceneCbData.jitterOffset.x = halton2[phase] - 0.5f;
+        m_sceneCbData.jitterOffset.y = halton3[phase] - 0.5f;
+    }
 
     // Map and update SceneCB
     void* cbMapped = nullptr;
     D3D12_RANGE readRange = { 0, 0 }; // We do not intend to read from this resource on the CPU
-    if (SUCCEEDED(m_sceneCb->Map(0, &readRange, &cbMapped))) {
+    ComPtr<ID3D12Resource>& frameSceneCb = m_sceneCb[m_sceneCbFrameIndex];
+    if (frameSceneCb && SUCCEEDED(frameSceneCb->Map(0, &readRange, &cbMapped)) && cbMapped) {
         std::memcpy(cbMapped, &m_sceneCbData, sizeof(SceneCB));
-        m_sceneCb->Unmap(0, nullptr);
+        frameSceneCb->Unmap(0, nullptr);
+    } else {
+        std::cerr << "[Scene Error] Could not map SceneCB for frame " << m_sceneCbFrameIndex
+                  << "; the GPU will retain its previous camera/scene parameters.\n";
     }
 }
 
