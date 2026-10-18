@@ -19,7 +19,6 @@ The renderer favors a fast direct-lighting mode for interaction and provides a s
 | ECS scene selector and Inspector | Implemented, bounded scope | Name/ID filtering, checked O(1) entity-ID lookup, source-node path grouping for glTF primitives, viewport ray picking against transformed world-space mesh bounds, transform editing, and per-entity material overrides. The picker uses AABBs, so it can select empty space inside a mesh's bounds. Storage remains a bundled `SceneEntity` plus parallel render arrays; there are no generic component pools, entity destruction/generation handles, or editable parent-transform graph. |
 | RTXDI/ReSTIR, RTXGI, RTXPT | Reference sources only | Source trees are preserved under `vendor/nvidia/` with their license files. These SDKs are not linked into the running renderer. In particular, ReSTIR needs reservoir storage and temporal/spatial reuse passes that this renderer does not implement. |
 | RTXMG, RTXMU, RTXNTC | Not present or integrated | These SDKs are not dependencies of the current executable and are not included in the checked-in vendor source tree. |
-| Skeletal animation and full O3DE Atom systems | Not implemented | The current scene path renders static mesh instances. It does not include an animation playback/skinning system, Atom material pipeline, or full O3DE lighting/post-processing stack. |
 
 ## Render Captures
 
