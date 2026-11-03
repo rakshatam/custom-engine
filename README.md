@@ -31,7 +31,7 @@ The ocean preview is assembled from a 60 Hz Jolt simulation at 30 frames per sec
 
 ![Jolt ocean buoyancy sequence at 30 FPS](docs/media/water-bounce-30fps.gif)
 
-## Verification snapshot: 2026-11-03
+## Verification snapshot:
 
 Tests and captures were run on this Windows machine with an NVIDIA RTX 3050 Laptop GPU. Resolution-sensitive capture suites used 1920x1080 output. Short GPU timing windows vary with driver, power mode, clock, temperature, editor layout, and background load; the numbers below are observations, not performance guarantees.
 
