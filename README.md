@@ -22,7 +22,7 @@ A Windows C++20 editor and renderer built on Direct3D 12 and DXR. The checked-in
 
 These Sponza editor screenshots were supplied for the repository. Their FPS overlays are readings from those captures, not benchmarks.
 
-![Sponza path tracing at 1920x1080; overlay shows 341 accumulated samples](docs/media/sponza-path-traced-1080p.png)
+
 
 ![Sponza direct rendering with DXR reflections enabled at 1920x1080](docs/media/sponza-rt-reflections.png)
 
