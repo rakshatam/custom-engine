@@ -65,7 +65,7 @@ bool NRDDenoiser::initialize(D3D12Device& device, uint32_t width, uint32_t heigh
     deviceDesc.disableD3D12EnhancedBarriers = true;
     deviceDesc.disableNVAPIInitialization = true;
 
-    const nrd::DenoiserDesc denoiserDesc = { m_state->denoiserId, nrd::Denoiser::REBLUR_DIFFUSE };
+    const nrd::DenoiserDesc denoiserDesc = { m_state->denoiserId, nrd::Denoiser::REBLUR_DIFFUSE_SPECULAR };
     nrd::InstanceCreationDesc instanceDesc = {};
     instanceDesc.denoisers = &denoiserDesc;
     instanceDesc.denoisersNum = 1;
@@ -88,7 +88,7 @@ bool NRDDenoiser::initialize(D3D12Device& device, uint32_t width, uint32_t heigh
     } else {
         std::cout << "[NRD] NVIDIA NRD " << static_cast<uint32_t>(nrd::GetLibraryDesc()->versionMajor)
                   << '.' << static_cast<uint32_t>(nrd::GetLibraryDesc()->versionMinor)
-                  << " REBLUR_DIFFUSE ready at " << width << 'x' << height << '\n';
+                  << " REBLUR_DIFFUSE_SPECULAR ready at " << width << 'x' << height << '\n';
     }
     return m_state->ready;
 }
@@ -101,12 +101,15 @@ bool NRDDenoiser::denoise(D3D12Device& device, const SceneCB& scene,
                           DirectX::FXMMATRIX viewToClip,
                           DirectX::FXMMATRIX worldToView,
                           ID3D12Resource* signal,
+                          ID3D12Resource* specularSignal,
                           ID3D12Resource* normalRoughness,
                           ID3D12Resource* viewZ,
                           ID3D12Resource* motion,
-                          ID3D12Resource* denoisedOutput,
-                          bool outputIsShaderResource) {
-    if (!isReady() || !signal || !normalRoughness || !viewZ || !motion || !denoisedOutput) return false;
+                          ID3D12Resource* denoisedDiffuse,
+                          ID3D12Resource* denoisedSpecular,
+                          bool outputsAreShaderResources) {
+    if (!isReady() || !signal || !specularSignal || !normalRoughness || !viewZ || !motion ||
+        !denoisedDiffuse || !denoisedSpecular) return false;
 
     nrd::CommonSettings common = {};
     float currentViewToClip[16] = {};
@@ -159,8 +162,12 @@ bool NRDDenoiser::denoise(D3D12Device& device, const SceneCB& scene,
     // Static Sponza is accumulated for more than 30 frames in the editor.
     // Retain a longer stable history to reduce one-sample path variance while
     // keeping a short fast history for camera reprojection/disocclusions.
-    settings.maxAccumulatedFrameNum = 48;
+    settings.maxAccumulatedFrameNum = 120;
     settings.maxFastAccumulatedFrameNum = 8;
+    // Specular reflection rays are sampled at half rate with an alternating
+    // 2x2 checkerboard. Reconstruct their invalid zero hit distances before
+    // REBLUR's tracking/reprojection passes, as required for probabilistic rays.
+    settings.hitDistanceReconstructionMode = nrd::HitDistanceReconstructionMode::AREA_3X3;
     settings.enableAntiFirefly = true;
     if (m_state->integration.SetDenoiserSettings(m_state->denoiserId, &settings) != nrd::Result::SUCCESS) return false;
 
@@ -172,9 +179,13 @@ bool NRDDenoiser::denoise(D3D12Device& device, const SceneCB& scene,
     setExternalTexture(resources, nrd::ResourceType::IN_NORMAL_ROUGHNESS, normalRoughness, DXGI_FORMAT_R10G10B10A2_UNORM, rw, rwLayout);
     setExternalTexture(resources, nrd::ResourceType::IN_VIEWZ, viewZ, DXGI_FORMAT_R32_FLOAT, rw, rwLayout);
     setExternalTexture(resources, nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST, signal, DXGI_FORMAT_R32G32B32A32_FLOAT, rw, rwLayout);
-    const nri::AccessBits outputAccess = outputIsShaderResource ? nri::AccessBits::SHADER_RESOURCE : rw;
-    const nri::Layout outputLayout = outputIsShaderResource ? nri::Layout::SHADER_RESOURCE : rwLayout;
-    setExternalTexture(resources, nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, denoisedOutput,
+    setExternalTexture(resources, nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST, specularSignal,
+                       DXGI_FORMAT_R32G32B32A32_FLOAT, rw, rwLayout);
+    const nri::AccessBits outputAccess = outputsAreShaderResources ? nri::AccessBits::SHADER_RESOURCE : rw;
+    const nri::Layout outputLayout = outputsAreShaderResources ? nri::Layout::SHADER_RESOURCE : rwLayout;
+    setExternalTexture(resources, nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST, denoisedDiffuse,
+                       DXGI_FORMAT_R32G32B32A32_FLOAT, outputAccess, outputLayout);
+    setExternalTexture(resources, nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST, denoisedSpecular,
                        DXGI_FORMAT_R32G32B32A32_FLOAT, outputAccess, outputLayout);
 
     nri::CommandBufferD3D12Desc commandBuffer = {};
@@ -197,7 +208,8 @@ NRDDenoiser::~NRDDenoiser() = default;
 bool NRDDenoiser::initialize(D3D12Device&, uint32_t, uint32_t) { return false; }
 bool NRDDenoiser::isReady() const { return false; }
 bool NRDDenoiser::denoise(D3D12Device&, const SceneCB&, DirectX::FXMMATRIX, DirectX::FXMMATRIX,
-                          ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, bool) { return false; }
+                          ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, ID3D12Resource*,
+                          ID3D12Resource*, ID3D12Resource*, ID3D12Resource*, bool) { return false; }
 } // namespace Engine
 
 #endif

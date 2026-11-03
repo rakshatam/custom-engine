@@ -3,9 +3,12 @@
 #include "imgui_impl_win32.h"
 #include "../../shaders/ImGuiVS_Bytecode.h"
 #include "../../shaders/ImGuiPS_Bytecode.h"
+#include "ImGuiProjectionMath.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
+#include <limits>
+#include <cmath>
 #include "../core/ImageCapture.h"
 
 namespace Engine {
@@ -188,7 +191,23 @@ bool ImGuiRenderer::createFontTexture(D3D12Device& device) {
     int width = 0, height = 0;
     io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
 
-    uint64_t uploadSize = width * height * 4;
+    if (!pixels || width <= 0 || height <= 0) {
+        std::cerr << "[ImGui Error] Font atlas returned invalid RGBA pixels or dimensions.\n";
+        return false;
+    }
+    const uint64_t sourceRowBytes = static_cast<uint64_t>(width) * 4u;
+    constexpr uint64_t rowPitchAlignment = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    if (sourceRowBytes > std::numeric_limits<uint64_t>::max() - (rowPitchAlignment - 1u)) {
+        std::cerr << "[ImGui Error] Font atlas row pitch overflows the upload-size type.\n";
+        return false;
+    }
+    const uint64_t uploadRowPitch = (sourceRowBytes + rowPitchAlignment - 1u) & ~(rowPitchAlignment - 1u);
+    if (uploadRowPitch > std::numeric_limits<uint32_t>::max() ||
+        uploadRowPitch == 0 || static_cast<uint64_t>(height) > std::numeric_limits<uint64_t>::max() / uploadRowPitch) {
+        std::cerr << "[ImGui Error] Font atlas padded upload size is not representable.\n";
+        return false;
+    }
+    const uint64_t uploadSize = uploadRowPitch * static_cast<uint64_t>(height);
 
     m_fontTexture = device.createTexture2D(
         width, height,
@@ -204,11 +223,19 @@ bool ImGuiRenderer::createFontTexture(D3D12Device& device) {
     );
 
     void* mapped = nullptr;
-    uploadBuffer->Map(0, nullptr, &mapped);
-    std::memcpy(mapped, pixels, uploadSize);
+    if (!m_fontTexture || !uploadBuffer || FAILED(uploadBuffer->Map(0, nullptr, &mapped)) || !mapped) {
+        std::cerr << "[ImGui Error] Could not allocate/map the font texture upload resources.\n";
+        return false;
+    }
+    std::memset(mapped, 0, static_cast<size_t>(uploadSize));
+    for (int row = 0; row < height; ++row) {
+        std::memcpy(static_cast<uint8_t*>(mapped) + static_cast<size_t>(row) * static_cast<size_t>(uploadRowPitch),
+                    pixels + static_cast<size_t>(row) * static_cast<size_t>(sourceRowBytes),
+                    static_cast<size_t>(sourceRowBytes));
+    }
     uploadBuffer->Unmap(0, nullptr);
 
-    device.beginFrame();
+    if (!device.beginFrame()) return false;
     auto cmdList = device.getCommandList();
 
     D3D12_TEXTURE_COPY_LOCATION dst = {};
@@ -221,7 +248,7 @@ bool ImGuiRenderer::createFontTexture(D3D12Device& device) {
     footprint.Width = width;
     footprint.Height = height;
     footprint.Depth = 1;
-    footprint.RowPitch = width * 4;
+    footprint.RowPitch = static_cast<UINT>(uploadRowPitch);
 
     D3D12_TEXTURE_COPY_LOCATION src = {};
     src.pResource = uploadBuffer.Get();
@@ -231,8 +258,10 @@ bool ImGuiRenderer::createFontTexture(D3D12Device& device) {
     cmdList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     device.transitionBarrier(m_fontTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    device.endFrame();
-    device.waitForGpu();
+    if (!device.endFrame() || !device.waitForGpu()) {
+        std::cerr << "[ImGui Error] Font texture upload did not complete on the GPU.\n";
+        return false;
+    }
 
     m_fontSrvIndex = device.allocateSrvUavDescriptor();
     if (m_fontSrvIndex == 0xffffffffu) {
@@ -259,25 +288,64 @@ void ImGuiRenderer::render(D3D12Device& device) {
     ImGui::Render();
     ImDrawData* drawData = ImGui::GetDrawData();
 
-    if (!drawData || drawData->TotalVtxCount == 0) return;
-
-    uint32_t frameIndex = device.getFrameIndex();
-
-    uint32_t vertexBytes = drawData->TotalVtxCount * sizeof(ImDrawVert);
-    uint32_t indexBytes  = drawData->TotalIdxCount * sizeof(ImDrawIdx);
-
-    if (vertexBytes > m_vertexBufferSize[frameIndex] || indexBytes > m_indexBufferSize[frameIndex]) {
-        return; // Exceeds preallocated buffer size
+    if (!drawData || drawData->TotalVtxCount == 0 || drawData->TotalIdxCount == 0) return;
+    if (!drawData->Valid || drawData->TotalVtxCount < 0 || drawData->TotalIdxCount < 0 ||
+        drawData->CmdListsCount <= 0 || drawData->CmdLists.Size != drawData->CmdListsCount ||
+        !device.isFrameRecording()) {
+        std::cerr << "[ImGui Error] Refused invalid draw counts or command-list state.\n";
+        return;
     }
+    int64_t summedVertices = 0;
+    int64_t summedIndices = 0;
+    for (int listIndex = 0; listIndex < drawData->CmdListsCount; ++listIndex) {
+        const ImDrawList* list = drawData->CmdLists[listIndex];
+        if (!list || list->VtxBuffer.Size < 0 || list->IdxBuffer.Size < 0 ||
+            (list->VtxBuffer.Size > 0 && !list->VtxBuffer.Data) ||
+            (list->IdxBuffer.Size > 0 && !list->IdxBuffer.Data)) {
+            std::cerr << "[ImGui Error] Refused a null or malformed UI draw list.\n";
+            return;
+        }
+        summedVertices += list->VtxBuffer.Size;
+        summedIndices += list->IdxBuffer.Size;
+    }
+    if (summedVertices != drawData->TotalVtxCount || summedIndices != drawData->TotalIdxCount) {
+        std::cerr << "[ImGui Error] UI draw-list totals do not match the declared geometry totals.\n";
+        return;
+    }
+
+    const uint32_t frameIndex = device.getFrameIndex();
+    if (frameIndex >= D3D12Device::FRAME_COUNT || !m_vertexBuffer[frameIndex] || !m_indexBuffer[frameIndex]) {
+        std::cerr << "[ImGui Error] Current frame has no valid UI vertex/index upload buffers.\n";
+        return;
+    }
+
+    const uint64_t vertexBytes64 = static_cast<uint64_t>(drawData->TotalVtxCount) * sizeof(ImDrawVert);
+    const uint64_t indexBytes64 = static_cast<uint64_t>(drawData->TotalIdxCount) * sizeof(ImDrawIdx);
+
+    if (vertexBytes64 > m_vertexBufferSize[frameIndex] || indexBytes64 > m_indexBufferSize[frameIndex] ||
+        vertexBytes64 > std::numeric_limits<uint32_t>::max() || indexBytes64 > std::numeric_limits<uint32_t>::max()) {
+        std::cerr << "[ImGui Error] UI geometry exceeds the preallocated vertex/index buffer capacity.\n";
+        return;
+    }
+    const uint32_t vertexBytes = static_cast<uint32_t>(vertexBytes64);
+    const uint32_t indexBytes = static_cast<uint32_t>(indexBytes64);
 
     // Upload vertices and indices
     ImDrawVert* vtxDst = nullptr;
     ImDrawIdx*  idxDst = nullptr;
-    if (FAILED(m_vertexBuffer[frameIndex]->Map(0, nullptr, reinterpret_cast<void**>(&vtxDst)))) {
+    const HRESULT vertexMapResult = m_vertexBuffer[frameIndex]->Map(0, nullptr, reinterpret_cast<void**>(&vtxDst));
+    if (FAILED(vertexMapResult) || !vtxDst) {
+        if (SUCCEEDED(vertexMapResult)) m_vertexBuffer[frameIndex]->Unmap(0, nullptr);
+        std::cerr << "[ImGui Error] Could not map UI vertex buffer: HRESULT 0x"
+                  << std::hex << vertexMapResult << std::dec << ".\n";
         return;
     }
-    if (FAILED(m_indexBuffer[frameIndex]->Map(0, nullptr, reinterpret_cast<void**>(&idxDst)))) {
+    const HRESULT indexMapResult = m_indexBuffer[frameIndex]->Map(0, nullptr, reinterpret_cast<void**>(&idxDst));
+    if (FAILED(indexMapResult) || !idxDst) {
+        if (SUCCEEDED(indexMapResult)) m_indexBuffer[frameIndex]->Unmap(0, nullptr);
         m_vertexBuffer[frameIndex]->Unmap(0, nullptr);
+        std::cerr << "[ImGui Error] Could not map UI index buffer: HRESULT 0x"
+                  << std::hex << indexMapResult << std::dec << ".\n";
         return;
     }
 
@@ -292,20 +360,21 @@ void ImGuiRenderer::render(D3D12Device& device) {
     m_vertexBuffer[frameIndex]->Unmap(0, nullptr);
     m_indexBuffer[frameIndex]->Unmap(0, nullptr);
 
-    // Setup projection matrix
-    float L = drawData->DisplayPos.x;
-    float R = drawData->DisplayPos.x + drawData->DisplaySize.x;
-    float T = drawData->DisplayPos.y;
-    float B = drawData->DisplayPos.y + drawData->DisplaySize.y;
-    float mvp[4][4] = {
-        { 2.0f/(R-L),    0.0f,          0.0f, 0.0f },
-        { 0.0f,          2.0f/(T-B),    0.0f, 0.0f },
-        { 0.0f,          0.0f,          0.5f, 0.0f },
-        { (R+L)/(L-R),  (T+B)/(B-T),    0.5f, 1.0f },
-    };
+    // Setup projection matrix. Express the scale using DisplaySize directly so
+    // a finite but very large DisplayPos cannot overflow the R-L / B-T sums.
+    float mvp[4][4] = {};
+    if (!makeUiProjection(drawData->DisplayPos.x, drawData->DisplayPos.y,
+                          drawData->DisplaySize.x, drawData->DisplaySize.y, mvp)) {
+        std::cerr << "[ImGui Error] Refused a non-finite, zero-sized, or unrepresentable UI projection.\n";
+        return;
+    }
 
     auto cmdList = device.getCommandList();
     auto backBuffer = device.getCurrentBackBuffer();
+    if (!cmdList || !backBuffer || !m_rootSignature || !m_pipelineState) {
+        std::cerr << "[ImGui Error] Cannot record the UI draw without a command list, back buffer, or pipeline state.\n";
+        return;
+    }
 
     device.transitionBarrier(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
@@ -369,9 +438,20 @@ void ImGuiRenderer::render(D3D12Device& device) {
 }
 
 void ImGuiRenderer::copyBackBufferToReadback(D3D12Device& device, uint32_t width, uint32_t height) {
-    if (!m_uiReadbackBuffer) return;
+    constexpr uint32_t maximumCaptureWidth = 1920;
+    constexpr uint32_t maximumCaptureHeight = 1080;
+    m_uiReadbackValid = false;
+    if (!m_uiReadbackBuffer || !device.isFrameRecording() || width == 0 || height == 0 ||
+        width > maximumCaptureWidth || height > maximumCaptureHeight) {
+        std::cerr << "[ImGui Error] Refused a back-buffer capture outside the allocated 1920x1080 readback extent.\n";
+        return;
+    }
 
     auto backBuffer = device.getCurrentBackBuffer();
+    if (!backBuffer || !device.getCommandList()) {
+        std::cerr << "[ImGui Error] Cannot capture a missing back buffer or command list.\n";
+        return;
+    }
     device.transitionBarrier(backBuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
     D3D12_TEXTURE_COPY_LOCATION dst = {};
@@ -391,9 +471,18 @@ void ImGuiRenderer::copyBackBufferToReadback(D3D12Device& device, uint32_t width
 
     device.getCommandList()->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
     device.transitionBarrier(backBuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+    m_uiReadbackValid = true;
 }
 
 bool ImGuiRenderer::saveBackBufferToBmp(const std::string& filename, uint32_t width, uint32_t height, std::string* failureReason) {
+    if (width == 0 || height == 0 || width > 1920 || height > 1080) {
+        if (failureReason) *failureReason = "editor capture dimensions exceed the allocated 1920x1080 readback extent";
+        return false;
+    }
+    if (!m_uiReadbackValid) {
+        if (failureReason) *failureReason = "no valid back-buffer capture has been recorded for this frame";
+        return false;
+    }
     if (!m_uiReadbackBuffer) {
         if (failureReason) *failureReason = "editor backbuffer readback buffer was not allocated";
         std::cout << "[saveBackBufferToBmp] m_uiReadbackBuffer is null!" << std::endl;
@@ -411,7 +500,8 @@ bool ImGuiRenderer::saveBackBufferToBmp(const std::string& filename, uint32_t wi
         return false;
     }
     bool ok = ImageCapture::saveBmp(filename, width, height, mappedData, m_uiReadbackPitch);
-    m_uiReadbackBuffer->Unmap(0, nullptr);
+    const D3D12_RANGE noCpuWrites = { 0, 0 };
+    m_uiReadbackBuffer->Unmap(0, &noCpuWrites);
     if (!ok) {
         if (failureReason) *failureReason = "editor BMP output could not be opened or written";
         std::cout << "[saveBackBufferToBmp] saveBmp returned false for " << filename << std::endl;

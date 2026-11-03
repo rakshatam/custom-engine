@@ -5,8 +5,158 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <array>
 
 namespace Engine {
+
+namespace {
+
+bool projectToViewport(const Vec3& position, const XMMATRIX& viewProjection,
+                      float viewportX, float viewportY, float viewportW, float viewportH,
+                      ImVec2& screen, float& depth) {
+    if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z) ||
+        !std::isfinite(viewportX) || !std::isfinite(viewportY) ||
+        !std::isfinite(viewportW) || !std::isfinite(viewportH) || viewportW <= 0.0f || viewportH <= 0.0f) {
+        return false;
+    }
+    const XMVECTOR clip = XMVector4Transform(XMVectorSet(position.x, position.y, position.z, 1.0f), viewProjection);
+    const float clipW = XMVectorGetW(clip);
+    if (!std::isfinite(clipW) || clipW <= 1.0e-5f) return false;
+    const float ndcX = XMVectorGetX(clip) / clipW;
+    const float ndcY = XMVectorGetY(clip) / clipW;
+    depth = XMVectorGetZ(clip) / clipW;
+    if (!std::isfinite(ndcX) || !std::isfinite(ndcY) || !std::isfinite(depth) || depth < 0.0f || depth > 1.0f) {
+        return false;
+    }
+    screen = ImVec2(viewportX + (ndcX + 1.0f) * 0.5f * viewportW,
+                    viewportY + (1.0f - ndcY) * 0.5f * viewportH);
+    return std::isfinite(screen.x) && std::isfinite(screen.y);
+}
+
+void drawSelectionOverlay(ImDrawList* drawList, const SceneEntity& entity, const CameraComponent& camera,
+                          const Vec3& localAnchor, float projectionAspect,
+                          float viewportX, float viewportY, float viewportW, float viewportH) {
+    if (!drawList || entity.mesh.localAABB.min.x > entity.mesh.localAABB.max.x ||
+        entity.mesh.localAABB.min.y > entity.mesh.localAABB.max.y ||
+        entity.mesh.localAABB.min.z > entity.mesh.localAABB.max.z) return;
+
+    const XMMATRIX world = XMMatrixScaling(entity.transform.scale.x, entity.transform.scale.y, entity.transform.scale.z) *
+        XMMatrixRotationRollPitchYaw(entity.transform.rotation.x * (3.14159265f / 180.0f),
+                                     entity.transform.rotation.y * (3.14159265f / 180.0f),
+                                     entity.transform.rotation.z * (3.14159265f / 180.0f)) *
+        XMMatrixTranslation(entity.transform.position.x, entity.transform.position.y, entity.transform.position.z);
+    const float safeProjectionAspect = std::isfinite(projectionAspect) && projectionAspect > 1.0e-4f
+        ? projectionAspect : viewportW / viewportH;
+    const XMMATRIX viewProjection = camera.getViewMatrix() * camera.getProjMatrix(safeProjectionAspect);
+    const XMVECTOR worldCenterVector = XMVector3TransformCoord(
+        XMVectorSet(localAnchor.x, localAnchor.y, localAnchor.z, 1.0f), world);
+    XMFLOAT3 worldCenterFloat;
+    XMStoreFloat3(&worldCenterFloat, worldCenterVector);
+    const Vec3 worldCenter(worldCenterFloat.x, worldCenterFloat.y, worldCenterFloat.z);
+
+    const float localDiagonal = (entity.mesh.localAABB.max - entity.mesh.localAABB.min).length();
+    const float cameraDistance = (camera.position - worldCenter).length();
+    // Scene assets can be thousands of world units from the editor camera.
+    // A fixed 20-unit cap made the axes subpixel at that scale. Size the gizmo
+    // as a fraction of view distance, and keep it below one quarter of that
+    // distance so its endpoints remain close to the selected surface.
+    const float maxAxisLength = std::max(0.1f, cameraDistance * 0.25f);
+    const float desiredAxisLength = std::max(localDiagonal * 0.12f, cameraDistance * 0.14f);
+    const float axisLength = std::clamp(desiredAxisLength, 0.1f, maxAxisLength);
+    const ImU32 axisColors[3] = { IM_COL32(255, 76, 76, 255), IM_COL32(78, 255, 112, 255), IM_COL32(84, 160, 255, 255) };
+    const char* axisLabels[3] = { "X", "Y", "Z" };
+    const XMVECTOR localAxes[3] = {
+        XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f), XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f), XMVectorSet(0.0f, 0.0f, 1.0f, 0.0f)
+    };
+
+    ImVec2 centerScreen;
+    float centerDepth = 0.0f;
+    const bool centerVisible = projectToViewport(worldCenter, viewProjection, viewportX, viewportY, viewportW, viewportH,
+                                                centerScreen, centerDepth);
+
+    // A thin 3D bounds box makes the selected mesh readable without changing its render material.
+    std::array<ImVec2, 8> cornersScreen{};
+    std::array<bool, 8> cornersVisible{};
+    std::array<Vec3, 8> cornersWorld{};
+    for (uint32_t corner = 0; corner < 8; ++corner) {
+        const Vec3 local((corner & 1u) ? entity.mesh.localAABB.max.x : entity.mesh.localAABB.min.x,
+                         (corner & 2u) ? entity.mesh.localAABB.max.y : entity.mesh.localAABB.min.y,
+                         (corner & 4u) ? entity.mesh.localAABB.max.z : entity.mesh.localAABB.min.z);
+        XMFLOAT3 transformed;
+        XMStoreFloat3(&transformed, XMVector3TransformCoord(XMVectorSet(local.x, local.y, local.z, 1.0f), world));
+        cornersWorld[corner] = Vec3(transformed.x, transformed.y, transformed.z);
+        float depth = 0.0f;
+        cornersVisible[corner] = projectToViewport(cornersWorld[corner], viewProjection,
+            viewportX, viewportY, viewportW, viewportH, cornersScreen[corner], depth);
+    }
+    const auto isInsideViewport = [viewportX, viewportY, viewportW, viewportH](const ImVec2& point) {
+        return point.x >= viewportX && point.x <= viewportX + viewportW &&
+               point.y >= viewportY && point.y <= viewportY + viewportH;
+    };
+    Vec3 axisOriginWorld = worldCenter;
+    ImVec2 axisOriginScreen = centerScreen;
+    bool axisOriginVisible = centerVisible && isInsideViewport(centerScreen);
+    if (!axisOriginVisible) {
+        const ImVec2 viewportCenter(viewportX + viewportW * 0.5f, viewportY + viewportH * 0.5f);
+        float closestCornerDistanceSquared = std::numeric_limits<float>::infinity();
+        for (uint32_t corner = 0; corner < 8; ++corner) {
+            if (!cornersVisible[corner] || !isInsideViewport(cornersScreen[corner])) continue;
+            const float dx = cornersScreen[corner].x - viewportCenter.x;
+            const float dy = cornersScreen[corner].y - viewportCenter.y;
+            const float distanceSquared = dx * dx + dy * dy;
+            if (distanceSquared < closestCornerDistanceSquared) {
+                closestCornerDistanceSquared = distanceSquared;
+                axisOriginWorld = cornersWorld[corner];
+                axisOriginScreen = cornersScreen[corner];
+                axisOriginVisible = true;
+            }
+        }
+    }
+    static constexpr uint32_t boxEdges[12][2] = {
+        {0,1},{0,2},{0,4},{1,3},{1,5},{2,3},{2,6},{3,7},{4,5},{4,6},{5,7},{6,7}
+    };
+    drawList->PushClipRect(ImVec2(viewportX, viewportY), ImVec2(viewportX + viewportW, viewportY + viewportH), true);
+    for (const auto& edge : boxEdges) {
+        if (!cornersVisible[edge[0]] || !cornersVisible[edge[1]]) continue;
+        drawList->AddLine(cornersScreen[edge[0]], cornersScreen[edge[1]], IM_COL32(12, 16, 24, 230), 4.0f);
+        drawList->AddLine(cornersScreen[edge[0]], cornersScreen[edge[1]], IM_COL32(255, 232, 76, 245), 2.0f);
+    }
+    if (axisOriginVisible) {
+        for (int axis = 0; axis < 3; ++axis) {
+            const XMVECTOR direction = XMVector3TransformNormal(localAxes[axis], world);
+            XMFLOAT3 directionFloat;
+            XMStoreFloat3(&directionFloat, direction);
+            Vec3 axisDirection(directionFloat.x, directionFloat.y, directionFloat.z);
+            const float axisDirectionLength = axisDirection.length();
+            if (!std::isfinite(axisDirectionLength) || axisDirectionLength <= 1.0e-6f) continue;
+            axisDirection = axisDirection / axisDirectionLength;
+
+            ImVec2 endScreen;
+            bool endpointVisible = false;
+            // Prefer the positive local axis, but use the opposite direction
+            // when the selected point lies close to a near/far clip boundary.
+            for (const float sign : { 1.0f, -1.0f }) {
+                const Vec3 endpoint = axisOriginWorld + axisDirection * (axisLength * sign);
+                float endDepth = 0.0f;
+                if (projectToViewport(endpoint, viewProjection, viewportX, viewportY, viewportW, viewportH,
+                                      endScreen, endDepth)) {
+                    endpointVisible = true;
+                    break;
+                }
+            }
+            if (!endpointVisible) continue;
+            drawList->AddLine(axisOriginScreen, endScreen, IM_COL32(10, 12, 16, 230), 5.0f);
+            drawList->AddLine(axisOriginScreen, endScreen, axisColors[axis], 3.0f);
+            drawList->AddCircleFilled(endScreen, 4.5f, axisColors[axis], 12);
+            drawList->AddText(ImVec2(endScreen.x + 5.0f, endScreen.y - 8.0f), axisColors[axis], axisLabels[axis]);
+        }
+        drawList->AddCircleFilled(axisOriginScreen, 5.0f, IM_COL32(255, 255, 255, 255), 12);
+        drawList->AddCircle(axisOriginScreen, 7.0f, IM_COL32(20, 24, 30, 255), 12, 2.0f);
+    }
+    drawList->PopClipRect();
+}
+
+} // namespace
 
 void EditorUI::init(D3D12Device& device, bool nativeResolution) {
     m_currentPreset = nativeResolution ? ResolutionPreset::Res_1080p : ResolutionPreset::Scale_75;
@@ -14,14 +164,27 @@ void EditorUI::init(D3D12Device& device, bool nativeResolution) {
     m_resolutionChanged = false;
 }
 
+void EditorUI::setDlssStartupMode(bool srEnabled, bool rrEnabled) {
+    m_dlssRrEnabled = rrEnabled;
+    m_dlssSrEnabled = srEnabled && !rrEnabled;
+    updateRenderResolution();
+    m_resolutionChanged = false;
+}
+
+void EditorUI::setDlssSceneAllowed(bool allowed) {
+    if (m_dlssSceneAllowed == allowed) return;
+    m_dlssSceneAllowed = allowed;
+    updateRenderResolution();
+}
+
 void EditorUI::updateRenderResolution() {
-    uint32_t width = m_targetRenderWidth;
-    uint32_t height = m_targetRenderHeight;
+    uint32_t outputWidth = m_targetOutputWidth;
+    uint32_t outputHeight = m_targetOutputHeight;
     switch (m_currentPreset) {
-    case ResolutionPreset::Res_720p:  width = 1280; height = 720; break;
-    case ResolutionPreset::Res_1080p: width = 1920; height = 1080; break;
-    case ResolutionPreset::Res_1440p: width = 2560; height = 1440; break;
-    case ResolutionPreset::Res_4K:    width = 3840; height = 2160; break;
+    case ResolutionPreset::Res_720p:  outputWidth = 1280; outputHeight = 720; break;
+    case ResolutionPreset::Res_1080p: outputWidth = 1920; outputHeight = 1080; break;
+    case ResolutionPreset::Res_1440p: outputWidth = 2560; outputHeight = 1440; break;
+    case ResolutionPreset::Res_4K:    outputWidth = 3840; outputHeight = 2160; break;
     case ResolutionPreset::Adaptive_60FPS:
     case ResolutionPreset::Scale_50:
     case ResolutionPreset::Scale_75:
@@ -35,15 +198,27 @@ void EditorUI::updateRenderResolution() {
             const uint32_t pixels = std::max(64u, static_cast<uint32_t>(value));
             return (pixels + 7u) & ~7u;
         };
-        width = alignDimension(m_panelW * scale);
-        height = alignDimension(m_panelH * scale);
+        outputWidth = alignDimension(m_panelW * scale);
+        outputHeight = alignDimension(m_panelH * scale);
         break;
     }
     }
 
-    if (width != m_targetRenderWidth || height != m_targetRenderHeight) {
-        m_targetRenderWidth = width;
-        m_targetRenderHeight = height;
+    const bool dlssRequested = m_dlssSceneAllowed && (m_dlssSrEnabled || m_dlssRrEnabled);
+    const float inputScale = dlssRequested ? std::clamp(m_dlssRenderScale, 0.50f, 1.0f) : 1.0f;
+    const auto alignDimension = [](float value) {
+        const uint32_t pixels = std::max(64u, static_cast<uint32_t>(value));
+        return (pixels + 7u) & ~7u;
+    };
+    const uint32_t renderWidth = alignDimension(static_cast<float>(outputWidth) * inputScale);
+    const uint32_t renderHeight = alignDimension(static_cast<float>(outputHeight) * inputScale);
+
+    if (renderWidth != m_targetRenderWidth || renderHeight != m_targetRenderHeight ||
+        outputWidth != m_targetOutputWidth || outputHeight != m_targetOutputHeight) {
+        m_targetRenderWidth = renderWidth;
+        m_targetRenderHeight = renderHeight;
+        m_targetOutputWidth = outputWidth;
+        m_targetOutputHeight = outputHeight;
         m_resolutionChanged = true;
     }
 }
@@ -112,12 +287,14 @@ void EditorUI::updateAndRender(D3D12Device& device, RayTracingPipeline& pipeline
     }
 
     renderMenuBar(scene);
-    renderViewport(device, pipeline);
+    renderViewport(device, pipeline, scene);
 
     if (m_showHierarchy) renderSceneHierarchy(scene);
     if (m_showInspector) renderInspector(scene);
     if (m_showSettings)  renderGraphicsSettings(scene, pipeline);
-    if (m_showTelemetry) renderTelemetry(device, scene, deltaTime, pipeline.isNrdAvailable());
+    if (m_showTelemetry) {
+        renderTelemetry(device, scene, deltaTime, pipeline);
+    }
 
     ImGui::End();
 }
@@ -156,7 +333,7 @@ void EditorUI::renderMenuBar(const Scene& scene) {
     }
 }
 
-void EditorUI::renderViewport(D3D12Device& device, RayTracingPipeline& pipeline) {
+void EditorUI::renderViewport(D3D12Device& device, RayTracingPipeline& pipeline, const Scene& scene) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
     ImGui::Begin("3D Ray Tracing Viewport", nullptr, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
@@ -171,7 +348,7 @@ void EditorUI::renderViewport(D3D12Device& device, RayTracingPipeline& pipeline)
     m_panelH = std::max(vMax.y - vMin.y, 100.0f);
     updateRenderResolution();
 
-    const float renderAspect = static_cast<float>(pipeline.getRenderWidth()) / std::max(1u, pipeline.getRenderHeight());
+    const float renderAspect = static_cast<float>(pipeline.getOutputWidth()) / std::max(1u, pipeline.getOutputHeight());
     m_viewportW = m_panelW;
     m_viewportH = m_panelH;
     if (m_viewportW / m_viewportH > renderAspect) {
@@ -187,6 +364,14 @@ void EditorUI::renderViewport(D3D12Device& device, RayTracingPipeline& pipeline)
     ImGui::SetCursorScreenPos(ImVec2(m_viewportX, m_viewportY));
     ImGui::Image(static_cast<ImTextureID>(srvHandle.ptr), ImVec2(m_viewportW, m_viewportH));
 
+    if (const SceneEntity* selected = scene.getEntity(scene.getSelectedEntityId())) {
+        const float projectionAspect = static_cast<float>(pipeline.getRenderWidth()) /
+            static_cast<float>(std::max(1u, pipeline.getRenderHeight()));
+        drawSelectionOverlay(ImGui::GetWindowDrawList(), *selected, scene.getCamera(),
+                             scene.getSelectedEntityLocalAnchor(), projectionAspect,
+                             m_viewportX, m_viewportY, m_viewportW, m_viewportH);
+    }
+
     // Viewport Top-Left Overlay
     ImGui::SetCursorPos(ImVec2(15.0f, 35.0f));
     ImGui::BeginGroup();
@@ -195,7 +380,10 @@ void EditorUI::renderViewport(D3D12Device& device, RayTracingPipeline& pipeline)
     ImGui::PopStyleColor();
 
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.85f, 0.85f, 0.85f));
-    ImGui::Text("Resolution: %u x %u | FPS: %.1f (%.2f ms)", pipeline.getRenderWidth(), pipeline.getRenderHeight(), m_fps, m_frameTimeMs);
+    ImGui::Text("Render: %u x %u -> Output: %u x %u", pipeline.getRenderWidth(), pipeline.getRenderHeight(),
+                pipeline.getOutputWidth(), pipeline.getOutputHeight());
+    const std::string dlssDisplayStatus = getDlssDisplayStatus(pipeline);
+    ImGui::Text("DLSS: %s | FPS: %.1f (%.2f ms)", dlssDisplayStatus.c_str(), m_fps, m_frameTimeMs);
     ImGui::Text("[RMB]: Look | [WASD]: Move | [LMB]: Select Entity");
     ImGui::PopStyleColor();
     ImGui::EndGroup();
@@ -364,9 +552,66 @@ void EditorUI::renderGraphicsSettings(Scene& scene, RayTracingPipeline& pipeline
 
     ImGui::Separator();
 
+    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "NVIDIA DLSS (NGX)");
+    ImGui::TextDisabled("Selected preset is the output size; DLSS scale lowers actual DXR input work.");
+    const bool dlssAvailable = pipeline.isDlssAvailable();
+    const bool dlssSceneSupported = !scene.isOceanScene() && !scene.isReflectionLabScene() &&
+        scene.getSceneCB().renderMode <= 1u;
+    const bool dlssAllowed = dlssAvailable && dlssSceneSupported;
+    setDlssSceneAllowed(dlssAllowed);
+    ImGui::BeginDisabled(!dlssAllowed);
+    bool srEnabled = m_dlssSrEnabled;
+    if (ImGui::Checkbox("DLSS Super Resolution", &srEnabled)) {
+        m_dlssSrEnabled = srEnabled;
+        if (srEnabled) m_dlssRrEnabled = false;
+        updateRenderResolution();
+        scene.resetAccumulation();
+    }
+    bool rrEnabled = m_dlssRrEnabled;
+    if (ImGui::Checkbox("DLSS Ray Reconstruction", &rrEnabled)) {
+        m_dlssRrEnabled = rrEnabled;
+        if (rrEnabled) m_dlssSrEnabled = false;
+        updateRenderResolution();
+        scene.resetAccumulation();
+    }
+    if (m_dlssSrEnabled || m_dlssRrEnabled) {
+        const char* scaleLabel = m_dlssSrEnabled ? "SR Input Scale" : "RR Input Scale";
+        if (ImGui::SliderFloat(scaleLabel, &m_dlssRenderScale, 0.50f, 1.0f, "%.3f")) {
+            updateRenderResolution();
+            scene.resetAccumulation();
+        }
+        if (m_dlssRrEnabled) {
+            int rrPreset = static_cast<int>(m_dlssRrPreset) - 4;
+            const char* rrPresetNames[] = { "D (Transformer)", "E (Transformer / DoF)", "F (RR2)" };
+            const int labelIndex = std::clamp(rrPreset, 0, 2);
+            if (ImGui::SliderInt("RR Model Preset", &rrPreset, 0, 2, rrPresetNames[labelIndex])) {
+                m_dlssRrPreset = static_cast<uint32_t>(rrPreset + 4);
+                scene.resetAccumulation();
+            }
+        }
+    }
+    ImGui::EndDisabled();
+    if (!dlssAvailable) {
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.3f, 1.0f), "DLSS unavailable: %s", pipeline.getDlssStatus().c_str());
+    } else if (!dlssSceneSupported) {
+        ImGui::TextDisabled("DLSS needs a supported static scene and Direct or Path Tracing mode.");
+    } else {
+        ImGui::TextDisabled("RR overrides SR and replaces NRD. Select one mode; both use the chosen input scale.");
+    }
+
+    ImGui::Separator();
+
     // GI & Lighting
     SceneCB& cb = scene.getSceneCB();
     LightComponent& sun = scene.getSun();
+
+    if (scene.isOceanScene()) {
+        if (ImGui::SliderFloat("Water reflection strength", &cb.waterReflectionStrength, 1.0f, 4.0f, "%.2fx")) {
+            scene.resetAccumulation();
+        }
+        ImGui::TextDisabled("Art-directed Fresnel blend; reflection energy is clamped to a bounded blend.");
+        ImGui::Separator();
+    }
 
     {
         bool rayTracedReflections = cb.enableRayTracedReflections > 0.5f;
@@ -386,18 +631,18 @@ void EditorUI::renderGraphicsSettings(Scene& scene, RayTracingPipeline& pipeline
     }
     ImGui::TextDisabled("Disabled = direct PBR lighting with DXR shadows; fastest interactive mode.");
 
-    if (pathTracingEnabled && !scene.isOceanScene()) {
+    if (cb.renderMode <= 1u && !scene.isOceanScene()) {
         bool nrdEnabled = cb.enableNRD != 0;
         ImGui::BeginDisabled(!pipeline.isNrdAvailable());
-        if (ImGui::Checkbox("NVIDIA NRD path denoiser", &nrdEnabled)) {
+        if (ImGui::Checkbox("NVIDIA NRD ray-tracing denoiser", &nrdEnabled)) {
             cb.enableNRD = nrdEnabled ? 1u : 0u;
             scene.resetAccumulation();
         }
         ImGui::EndDisabled();
         if (pipeline.isNrdAvailable()) {
-            ImGui::TextDisabled("REBLUR diffuse: temporal denoising at render resolution.");
+            ImGui::TextDisabled("REBLUR denoises diffuse/GI and DXR specular signals at render resolution.");
         } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.3f, 1.0f), "NRD unavailable; using the built-in temporal path.");
+            ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.3f, 1.0f), "NRD unavailable; using temporal accumulation.");
         }
     }
 
@@ -465,17 +710,60 @@ void EditorUI::renderGraphicsSettings(Scene& scene, RayTracingPipeline& pipeline
     ImGui::End();
 }
 
-void EditorUI::renderTelemetry(const D3D12Device& device, const Scene& scene, float deltaTime, bool nrdAvailable) {
+std::string EditorUI::getDlssDisplayStatus(const RayTracingPipeline& pipeline) const {
+    const bool selected = m_dlssSceneAllowed && (m_dlssSrEnabled || m_dlssRrEnabled);
+    if (!selected) {
+        return pipeline.isDlssOutputActive()
+            ? "Off; switching to native renderer output"
+            : "Off; native renderer output active";
+    }
+
+    const bool expectedModeActive = pipeline.isDlssOutputActive() &&
+        pipeline.isRayReconstructionActive() == m_dlssRrEnabled;
+    if (expectedModeActive) return pipeline.getDlssStatus();
+
+    const std::string& pipelineStatus = pipeline.getDlssStatus();
+    const bool statusIsDiagnostic = pipelineStatus.find("failed") != std::string::npos ||
+        pipelineStatus.find("unavailable") != std::string::npos ||
+        pipelineStatus.find("NGX ") != std::string::npos ||
+        pipelineStatus.find("Cannot ") != std::string::npos ||
+        pipelineStatus.find("Invalid ") != std::string::npos;
+    if (statusIsDiagnostic) return pipelineStatus;
+
+    return std::string(m_dlssRrEnabled ? "Ray Reconstruction" : "Super Resolution") +
+        " requested; waiting for output update";
+}
+
+void EditorUI::renderTelemetry(const D3D12Device& device, const Scene& scene, float deltaTime,
+                               const RayTracingPipeline& pipeline) {
     ImGui::Begin("Performance Telemetry");
 
     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.45f, 1.0f), "FPS: %.1f", m_fps);
     ImGui::Text("Frame Time: %.2f ms", m_frameTimeMs);
     ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Accumulated Samples (SPP): %u", scene.getAccumFrameCount());
     const auto& sceneCb = scene.getSceneCB();
-    const bool nrdActive = nrdAvailable && sceneCb.enableNRD != 0 && sceneCb.renderMode == 0;
-    const char* aaStatus = nrdActive ? "Active [NVIDIA NRD REBLUR]"
-        : (sceneCb.enableTAA != 0 ? "Active [depth-aware TAA]" : "Disabled");
-    ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.6f, 1.0f), "Denoising / AA: %s", aaStatus);
+    const bool rrRequested = m_dlssSceneAllowed && m_dlssRrEnabled;
+    const bool srRequested = m_dlssSceneAllowed && m_dlssSrEnabled;
+    const bool selectedModeActive = pipeline.isDlssOutputActive() &&
+        pipeline.isRayReconstructionActive() == rrRequested;
+    const bool nrdActive = pipeline.isNrdAvailable() && sceneCb.enableNRD != 0 &&
+        sceneCb.renderMode <= 1u && !rrRequested;
+    std::string aaStatus;
+    if (rrRequested && selectedModeActive) {
+        aaStatus = "Active [NVIDIA DLSS Ray Reconstruction]";
+    } else if (srRequested && selectedModeActive) {
+        aaStatus = nrdActive ? "Active [NVIDIA NRD REBLUR + DLSS Super Resolution]"
+                             : "Active [DLSS Super Resolution]";
+    } else if (rrRequested || srRequested) {
+        aaStatus = getDlssDisplayStatus(pipeline);
+    } else if (pipeline.isDlssOutputActive()) {
+        aaStatus = "DLSS off; native output update pending";
+    } else if (nrdActive) {
+        aaStatus = "Active [NVIDIA NRD REBLUR Diffuse + Specular]";
+    } else {
+        aaStatus = sceneCb.enableTAA != 0 ? "Active [depth-aware TAA]" : "Disabled";
+    }
+    ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.6f, 1.0f), "Denoising / AA: %s", aaStatus.c_str());
 
     ImGui::PlotLines("##FrameTimePlot", m_frameTimeHistory, 60, m_historyIndex, "Latency (ms)", 0.0f, 33.3f, ImVec2(-1.0f, 60.0f));
 

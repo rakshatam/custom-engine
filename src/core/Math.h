@@ -38,7 +38,7 @@ struct Vec3 {
     Vec3& operator*=(float s) { x *= s; y *= s; z *= s; return *this; }
 
     float lengthSq() const { return x * x + y * y + z * z; }
-    float length() const { return std::sqrt(lengthSq()); }
+    float length() const { return std::hypot(x, y, z); }
     Vec3 normalized() const {
         float l = length();
         if (!std::isfinite(l)) throw std::domain_error("Vec3 normalization received a non-finite vector");
@@ -120,7 +120,15 @@ struct Mat4 {
     static Mat4 rotationYawPitchRoll(float yawRad, float pitchRad, float rollRad) {
         XMMATRIX rot = XMMatrixRotationRollPitchYaw(pitchRad, yawRad, rollRad);
         Mat4 res;
-        XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(&res.m[0][0]), rot);
+        // Mat4's helpers use column vectors with translation in column 4;
+        // DirectXMath uses row vectors, so transpose at this boundary.
+        XMFLOAT4X4 transposed;
+        XMStoreFloat4x4(&transposed, XMMatrixTranspose(rot));
+        for (int row = 0; row < 4; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                res.m[row][column] = transposed.m[row][column];
+            }
+        }
         return res;
     }
 
@@ -148,8 +156,8 @@ struct Mat4 {
 };
 
 struct AABB {
-    Vec3 min = Vec3( 1e30f,  1e30f,  1e30f);
-    Vec3 max = Vec3(-1e30f, -1e30f, -1e30f);
+    Vec3 min = Vec3(std::numeric_limits<float>::max());
+    Vec3 max = Vec3(-std::numeric_limits<float>::max());
 
     void expand(const Vec3& p) {
         if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
@@ -164,35 +172,83 @@ struct AABB {
     }
 
     bool rayIntersect(const Vec3& rayOrigin, const Vec3& rayDir, float& outT) const {
-        const float origins[3] = {rayOrigin.x, rayOrigin.y, rayOrigin.z};
-        const float directions[3] = {rayDir.x, rayDir.y, rayDir.z};
-        const float minima[3] = {min.x, min.y, min.z};
-        const float maxima[3] = {max.x, max.y, max.z};
-        float tEnter = -std::numeric_limits<float>::infinity();
-        float tExit = std::numeric_limits<float>::infinity();
+        const double origins[3] = {rayOrigin.x, rayOrigin.y, rayOrigin.z};
+        const double directions[3] = {rayDir.x, rayDir.y, rayDir.z};
+        const double minima[3] = {min.x, min.y, min.z};
+        const double maxima[3] = {max.x, max.y, max.z};
+        double tEnter = -std::numeric_limits<double>::infinity();
+        double tExit = std::numeric_limits<double>::infinity();
 
         for (int axis = 0; axis < 3; ++axis) {
             if (!std::isfinite(origins[axis]) || !std::isfinite(directions[axis]) ||
                 !std::isfinite(minima[axis]) || !std::isfinite(maxima[axis]) || minima[axis] > maxima[axis]) {
                 return false;
             }
-            if (std::abs(directions[axis]) <= 1.0e-8f) {
+            if (directions[axis] == 0.0) {
                 if (origins[axis] < minima[axis] || origins[axis] > maxima[axis]) return false;
                 continue;
             }
-            const float inverseDirection = 1.0f / directions[axis];
-            float t0 = (minima[axis] - origins[axis]) * inverseDirection;
-            float t1 = (maxima[axis] - origins[axis]) * inverseDirection;
+            const double inverseDirection = 1.0 / directions[axis];
+            double t0 = (minima[axis] - origins[axis]) * inverseDirection;
+            double t1 = (maxima[axis] - origins[axis]) * inverseDirection;
             if (t0 > t1) std::swap(t0, t1);
             tEnter = std::max(tEnter, t0);
             tExit = std::min(tExit, t1);
-            if (tEnter > tExit) return false;
+            if (std::isnan(tEnter) || std::isnan(tExit) || tEnter > tExit) return false;
         }
 
         if (tExit < 0.0f || !std::isfinite(tExit)) return false;
-        outT = tEnter >= 0.0f ? tEnter : tExit;
+        const double hitT = tEnter >= 0.0 ? tEnter : tExit;
+        if (!std::isfinite(hitT) || hitT > std::numeric_limits<float>::max()) return false;
+        outT = static_cast<float>(hitT);
         return std::isfinite(outT);
     }
 };
+
+// Two-sided Möller–Trumbore ray/triangle intersection. rayDirection need not
+// be normalized; outT is the parameter in origin + direction * t and is only
+// written when a finite, forward hit is found.
+inline bool rayTriangleIntersect(const Vec3& rayOrigin, const Vec3& rayDirection,
+                                 const Vec3& v0, const Vec3& v1, const Vec3& v2,
+                                 float& outT) {
+    const double e1x = static_cast<double>(v1.x) - v0.x;
+    const double e1y = static_cast<double>(v1.y) - v0.y;
+    const double e1z = static_cast<double>(v1.z) - v0.z;
+    const double e2x = static_cast<double>(v2.x) - v0.x;
+    const double e2y = static_cast<double>(v2.y) - v0.y;
+    const double e2z = static_cast<double>(v2.z) - v0.z;
+    const double dx = rayDirection.x, dy = rayDirection.y, dz = rayDirection.z;
+    const double e1Sq = e1x * e1x + e1y * e1y + e1z * e1z;
+    const double e2Sq = e2x * e2x + e2y * e2y + e2z * e2z;
+    const double directionSq = dx * dx + dy * dy + dz * dz;
+    if (!std::isfinite(e1Sq) || !std::isfinite(e2Sq) || !std::isfinite(directionSq) ||
+        e1Sq <= 1.0e-30 || e2Sq <= 1.0e-30 || directionSq <= 1.0e-30) return false;
+
+    const double px = dy * e2z - dz * e2y;
+    const double py = dz * e2x - dx * e2z;
+    const double pz = dx * e2y - dy * e2x;
+    const double determinant = e1x * px + e1y * py + e1z * pz;
+    const double determinantTolerance = std::max(1.0e-30, 1.0e-8 * std::sqrt(e1Sq * e2Sq * directionSq));
+    if (!std::isfinite(determinant) || std::abs(determinant) <= determinantTolerance) return false;
+
+    const double inverseDeterminant = 1.0 / determinant;
+    const double tx = static_cast<double>(rayOrigin.x) - v0.x;
+    const double ty = static_cast<double>(rayOrigin.y) - v0.y;
+    const double tz = static_cast<double>(rayOrigin.z) - v0.z;
+    const double u = (tx * px + ty * py + tz * pz) * inverseDeterminant;
+    constexpr double barycentricTolerance = 1.0e-7;
+    if (!std::isfinite(u) || u < -barycentricTolerance || u > 1.0 + barycentricTolerance) return false;
+
+    const double qx = ty * e1z - tz * e1y;
+    const double qy = tz * e1x - tx * e1z;
+    const double qz = tx * e1y - ty * e1x;
+    const double v = (dx * qx + dy * qy + dz * qz) * inverseDeterminant;
+    if (!std::isfinite(v) || v < -barycentricTolerance || u + v > 1.0 + barycentricTolerance) return false;
+
+    const double t = (e2x * qx + e2y * qy + e2z * qz) * inverseDeterminant;
+    if (!std::isfinite(t) || t < 0.0 || t > std::numeric_limits<float>::max()) return false;
+    outT = static_cast<float>(t);
+    return true;
+}
 
 } // namespace Engine

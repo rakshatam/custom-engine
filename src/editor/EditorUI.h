@@ -25,6 +25,8 @@ public:
     ~EditorUI() = default;
 
     void init(D3D12Device& device, bool nativeResolution = false);
+    void setDlssStartupMode(bool srEnabled, bool rrEnabled);
+    void setDlssSceneAllowed(bool allowed);
     void updateAndRender(D3D12Device& device, RayTracingPipeline& pipeline, Scene& scene, float deltaTime);
     int consumeSceneSwitchRequest() { const int request = m_sceneSwitchRequest; m_sceneSwitchRequest = 0; return request; }
 
@@ -35,17 +37,25 @@ public:
 
     uint32_t getTargetRenderWidth() const { return m_targetRenderWidth; }
     uint32_t getTargetRenderHeight() const { return m_targetRenderHeight; }
+    uint32_t getTargetOutputWidth() const { return m_targetOutputWidth; }
+    uint32_t getTargetOutputHeight() const { return m_targetOutputHeight; }
+    bool isDlssSrEnabled() const { return m_dlssSrEnabled; }
+    bool isDlssRrEnabled() const { return m_dlssRrEnabled; }
+    float getDlssRenderScale() const { return m_dlssRenderScale; }
+    uint32_t getDlssRrPreset() const { return m_dlssRrPreset; }
     bool hasResolutionChanged() const { return m_resolutionChanged; }
     void clearResolutionChanged() { m_resolutionChanged = false; }
     bool isVsyncEnabled() const { return m_vsyncEnabled; }
 
 private:
     void renderMenuBar(const Scene& scene);
-    void renderViewport(D3D12Device& device, RayTracingPipeline& pipeline);
+    void renderViewport(D3D12Device& device, RayTracingPipeline& pipeline, const Scene& scene);
     void renderSceneHierarchy(Scene& scene);
     void renderInspector(Scene& scene);
     void renderGraphicsSettings(Scene& scene, RayTracingPipeline& pipeline);
-    void renderTelemetry(const D3D12Device& device, const Scene& scene, float deltaTime, bool nrdAvailable);
+    void renderTelemetry(const D3D12Device& device, const Scene& scene, float deltaTime,
+                         const RayTracingPipeline& pipeline);
+    std::string getDlssDisplayStatus(const RayTracingPipeline& pipeline) const;
     void updateRenderResolution();
 
     float m_viewportX = 0.0f;
@@ -57,11 +67,18 @@ private:
 
     uint32_t m_targetRenderWidth = 960;
     uint32_t m_targetRenderHeight = 540;
+    uint32_t m_targetOutputWidth = 960;
+    uint32_t m_targetOutputHeight = 540;
     ResolutionPreset m_currentPreset = ResolutionPreset::Scale_75;
     bool m_resolutionChanged = false;
     bool m_vsyncEnabled = false;
     float m_dynamicResolutionScale = 0.75f;
     float m_dynamicResolutionTimer = 0.0f;
+    bool m_dlssSrEnabled = false;
+    bool m_dlssRrEnabled = false;
+    bool m_dlssSceneAllowed = true;
+    float m_dlssRenderScale = 0.667f;
+    uint32_t m_dlssRrPreset = 4; // NVIDIA NGX Ray Reconstruction preset D.
 
     float m_fps = 60.0f;
     float m_frameTimeMs = 16.6f;

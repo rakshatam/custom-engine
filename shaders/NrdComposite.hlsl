@@ -1,10 +1,19 @@
 #include "NRD.hlsli"
 
-Texture2D<float4> g_DirectRadiance : register(t0);
+#ifndef ENGINE_ENABLE_DLSS
+#define ENGINE_ENABLE_DLSS 0
+#endif
+
+Texture2D<float4> g_PrimaryResidual : register(t0);
 Texture2D<float4> g_DenoisedDiffuse : register(t1);
-Texture2D<float4> g_Albedo : register(t2);
+Texture2D<float4> g_DiffuseFactor : register(t2);
 Texture2D<float>  g_ViewZ : register(t3);
+Texture2D<float4> g_DenoisedSpecular : register(t4);
+Texture2D<float4> g_SpecularFactor : register(t5);
 RWTexture2D<float4> g_Output : register(u0);
+#if ENGINE_ENABLE_DLSS
+RWTexture2D<float4> g_DLSSHDR : register(u1);
+#endif
 
 cbuffer CompositeSettings : register(b0) {
     float g_Exposure;
@@ -40,13 +49,18 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID) {
     const uint2 pixel = dispatchThreadId.xy;
     if (pixel.x >= width || pixel.y >= height) return;
 
-    const float4 direct = g_DirectRadiance[pixel];
+    const float4 residual = g_PrimaryResidual[pixel];
     const float viewZ = g_ViewZ[pixel];
-    float3 linearColor = direct.rgb;
+    float3 linearColor = residual.rgb;
     if (viewZ < 100000.0f) {
         const float3 denoisedLighting = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_DenoisedDiffuse[pixel]).rgb;
-        linearColor += denoisedLighting * g_Albedo[pixel].rgb;
+        const float3 denoisedSpecular = REBLUR_BackEnd_UnpackRadianceAndNormHitDist(g_DenoisedSpecular[pixel]).rgb;
+        linearColor += denoisedLighting * g_DiffuseFactor[pixel].rgb;
+        linearColor += denoisedSpecular * g_SpecularFactor[pixel].rgb;
     }
 
     g_Output[pixel] = float4(linearToSrgb(toneMap(linearColor)), 1.0f);
+#if ENGINE_ENABLE_DLSS
+    g_DLSSHDR[pixel] = float4(max(linearColor, 0.0f), 1.0f);
+#endif
 }

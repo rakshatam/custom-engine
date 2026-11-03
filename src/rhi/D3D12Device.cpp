@@ -10,14 +10,20 @@ D3D12Device::~D3D12Device() {
 }
 
 void D3D12Device::shutdown() {
-    waitForGpu();
+    if (m_shutdown) return;
+    if (!waitForGpu()) {
+        std::cerr << "[D3D12 Error] GPU drain failed during shutdown; releasing device resources anyway.\n";
+    }
     if (m_fenceEvent) {
         CloseHandle(m_fenceEvent);
         m_fenceEvent = nullptr;
     }
+    m_shutdown = true;
 }
 
 bool D3D12Device::init(HWND hwnd, uint32_t width, uint32_t height) {
+    m_shutdown = false;
+    m_frameRecording = false;
     m_hwnd = hwnd;
     m_width = width;
     m_height = height;
@@ -47,9 +53,22 @@ bool D3D12Device::init(HWND hwnd, uint32_t width, uint32_t height) {
 
     // Find adapter supporting DXR
     ComPtr<IDXGIAdapter1> selectedAdapter;
-    for (UINT i = 0; m_dxgiFactory->EnumAdapters1(i, &selectedAdapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC1 desc;
-        selectedAdapter->GetDesc1(&desc);
+    for (UINT i = 0;; ++i) {
+        selectedAdapter.Reset();
+        const HRESULT enumerateResult = m_dxgiFactory->EnumAdapters1(i, &selectedAdapter);
+        if (enumerateResult == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(enumerateResult)) {
+            std::cerr << "[DXGI Error] Adapter enumeration failed: HRESULT 0x"
+                      << std::hex << enumerateResult << std::dec << ".\n";
+            return false;
+        }
+        DXGI_ADAPTER_DESC1 desc = {};
+        const HRESULT descriptionResult = selectedAdapter->GetDesc1(&desc);
+        if (FAILED(descriptionResult)) {
+            std::cerr << "[DXGI Warning] Could not read adapter " << i << " description: HRESULT 0x"
+                      << std::hex << descriptionResult << std::dec << ".\n";
+            continue;
+        }
         if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
 
         // Try creating device
@@ -60,9 +79,17 @@ bool D3D12Device::init(HWND hwnd, uint32_t width, uint32_t height) {
                 if (options5.RaytracingTier >= D3D12_RAYTRACING_TIER_1_0) {
                     m_device = testDevice;
                     m_raytracingTier = options5.RaytracingTier;
-                    char buf[128];
-                    wcstombs(buf, desc.Description, sizeof(buf));
-                    m_gpuName = buf;
+                    const int utf8Bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                        desc.Description, -1, nullptr, 0, nullptr, nullptr);
+                    if (utf8Bytes > 1) {
+                        std::string gpuName(static_cast<size_t>(utf8Bytes), '\0');
+                        const int convertedBytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                            desc.Description, -1, gpuName.data(), utf8Bytes, nullptr, nullptr);
+                        if (convertedBytes > 1) {
+                            gpuName.resize(static_cast<size_t>(convertedBytes - 1));
+                            m_gpuName = std::move(gpuName);
+                        }
+                    }
                     break;
                 }
             }
@@ -96,8 +123,17 @@ bool D3D12Device::init(HWND hwnd, uint32_t width, uint32_t height) {
     if (FAILED(m_dxgiFactory->CreateSwapChainForHwnd(m_commandQueue.Get(), m_hwnd, &scDesc, nullptr, nullptr, &swapChain1))) {
         return false;
     }
-    swapChain1.As(&m_swapChain);
+    const HRESULT swapChainConvertResult = swapChain1.As(&m_swapChain);
+    if (FAILED(swapChainConvertResult) || !m_swapChain) {
+        std::cerr << "[DXGI Error] Could not obtain IDXGISwapChain3: HRESULT 0x"
+                  << std::hex << swapChainConvertResult << std::dec << ".\n";
+        return false;
+    }
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+    if (m_frameIndex >= FRAME_COUNT) {
+        std::cerr << "[DXGI Error] Initial back-buffer index is out of range: " << m_frameIndex << ".\n";
+        return false;
+    }
 
     // RTV Descriptor Heap
     D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
@@ -139,7 +175,12 @@ bool D3D12Device::init(HWND hwnd, uint32_t width, uint32_t height) {
     if (FAILED(m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_commandAllocators[m_frameIndex].Get(), nullptr, IID_PPV_ARGS(&m_commandList)))) {
         return false;
     }
-    m_commandList->Close();
+    const HRESULT initialCloseResult = m_commandList->Close();
+    if (FAILED(initialCloseResult)) {
+        std::cerr << "[D3D12 Error] Could not close the newly created command list: HRESULT 0x"
+                  << std::hex << initialCloseResult << std::dec << ".\n";
+        return false;
+    }
 
     // Fence & Event
     if (FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)))) {
@@ -156,25 +197,80 @@ bool D3D12Device::init(HWND hwnd, uint32_t width, uint32_t height) {
     return true;
 }
 
-void D3D12Device::waitForGpu() {
-    if (!m_commandQueue || !m_fence) return;
+bool D3D12Device::waitForGpu() {
+    // An uninitialized or already-shutdown object has nothing to drain.
+    if (!m_commandQueue && !m_fence) return true;
+    if (!m_commandQueue || !m_fence || !m_fenceEvent) {
+        std::cerr << "[D3D12 Error] Cannot wait for GPU: queue, fence, or fence event is unavailable.\n";
+        return false;
+    }
+    if (m_currentFence == std::numeric_limits<uint64_t>::max()) {
+        std::cerr << "[D3D12 Error] Fence value exhausted; refusing to wrap the GPU synchronization counter.\n";
+        return false;
+    }
     m_currentFence++;
-    m_commandQueue->Signal(m_fence.Get(), m_currentFence);
-    m_fence->SetEventOnCompletion(m_currentFence, m_fenceEvent);
-    WaitForSingleObject(m_fenceEvent, INFINITE);
+    HRESULT hr = m_commandQueue->Signal(m_fence.Get(), m_currentFence);
+    if (FAILED(hr)) {
+        std::cerr << "[D3D12 Error] Queue Signal failed while draining GPU work: HRESULT 0x"
+                  << std::hex << hr << std::dec << ".\n";
+        return false;
+    }
+    hr = m_fence->SetEventOnCompletion(m_currentFence, m_fenceEvent);
+    if (FAILED(hr)) {
+        std::cerr << "[D3D12 Error] SetEventOnCompletion failed while draining GPU work: HRESULT 0x"
+                  << std::hex << hr << std::dec << ".\n";
+        return false;
+    }
+    const DWORD waitResult = WaitForSingleObject(m_fenceEvent, INFINITE);
+    if (waitResult != WAIT_OBJECT_0) {
+        std::cerr << "[D3D12 Error] GPU fence wait failed; Win32 result=" << waitResult
+                  << ", GetLastError=" << GetLastError() << ".\n";
+        return false;
+    }
+    return true;
 }
 
-void D3D12Device::moveToNextFrame() {
+bool D3D12Device::moveToNextFrame() {
+    if (!m_commandQueue || !m_fence || !m_swapChain || !m_fenceEvent || m_frameIndex >= FRAME_COUNT ||
+        m_currentFence == std::numeric_limits<uint64_t>::max()) {
+        std::cerr << "[D3D12 Error] Cannot advance frame: synchronization or swap-chain state is invalid.\n";
+        return false;
+    }
     m_currentFence++;
-    m_commandQueue->Signal(m_fence.Get(), m_currentFence);
+    const HRESULT signalResult = m_commandQueue->Signal(m_fence.Get(), m_currentFence);
+    if (FAILED(signalResult)) {
+        std::cerr << "[D3D12 Error] Queue Signal failed while advancing frame: HRESULT 0x"
+                  << std::hex << signalResult << std::dec << ".\n";
+        return false;
+    }
     m_fenceValues[m_frameIndex] = m_currentFence;
 
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
-
-    if (m_fence->GetCompletedValue() < m_fenceValues[m_frameIndex]) {
-        m_fence->SetEventOnCompletion(m_fenceValues[m_frameIndex], m_fenceEvent);
-        WaitForSingleObject(m_fenceEvent, INFINITE);
+    if (m_frameIndex >= FRAME_COUNT) {
+        std::cerr << "[D3D12 Error] Swap chain returned an invalid back-buffer index " << m_frameIndex << ".\n";
+        return false;
     }
+
+    const uint64_t completedValue = m_fence->GetCompletedValue();
+    if (completedValue == std::numeric_limits<uint64_t>::max()) {
+        std::cerr << "[D3D12 Error] Fence reports device removal while advancing frame.\n";
+        return false;
+    }
+    if (completedValue < m_fenceValues[m_frameIndex]) {
+        const HRESULT eventResult = m_fence->SetEventOnCompletion(m_fenceValues[m_frameIndex], m_fenceEvent);
+        if (FAILED(eventResult)) {
+            std::cerr << "[D3D12 Error] SetEventOnCompletion failed while advancing frame: HRESULT 0x"
+                      << std::hex << eventResult << std::dec << ".\n";
+            return false;
+        }
+        const DWORD waitResult = WaitForSingleObject(m_fenceEvent, INFINITE);
+        if (waitResult != WAIT_OBJECT_0) {
+            std::cerr << "[D3D12 Error] Frame fence wait failed; Win32 result=" << waitResult
+                      << ", GetLastError=" << GetLastError() << ".\n";
+            return false;
+        }
+    }
+    return true;
 }
 
 bool D3D12Device::resize(uint32_t width, uint32_t height) {
@@ -182,7 +278,7 @@ bool D3D12Device::resize(uint32_t width, uint32_t height) {
     if (width == m_width && height == m_height) return true;
     if (!m_swapChain || !m_device || !m_rtvHeap) return false;
 
-    waitForGpu();
+    if (!waitForGpu()) return false;
 
     const uint32_t oldWidth = m_width;
     const uint32_t oldHeight = m_height;
@@ -347,22 +443,55 @@ void D3D12Device::uavBarrier(ID3D12Resource* resource) {
     m_commandList->ResourceBarrier(1, &barrier);
 }
 
-void D3D12Device::beginFrame() {
-    m_commandAllocators[m_frameIndex]->Reset();
-    m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr);
+bool D3D12Device::beginFrame() {
+    if (m_frameRecording || m_frameIndex >= FRAME_COUNT || !m_commandAllocators[m_frameIndex] ||
+        !m_commandList || !m_srvUavHeap) {
+        std::cerr << "[D3D12 Error] Cannot begin frame: command state is invalid or a frame is already recording.\n";
+        return false;
+    }
+
+    HRESULT hr = m_commandAllocators[m_frameIndex]->Reset();
+    if (FAILED(hr)) {
+        std::cerr << "[D3D12 Error] Command allocator Reset failed: HRESULT 0x"
+                  << std::hex << hr << std::dec << ".\n";
+        return false;
+    }
+    hr = m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr);
+    if (FAILED(hr)) {
+        std::cerr << "[D3D12 Error] Command list Reset failed: HRESULT 0x"
+                  << std::hex << hr << std::dec << ".\n";
+        return false;
+    }
+    m_frameRecording = true;
 
     ID3D12DescriptorHeap* heaps[] = { m_srvUavHeap.Get() };
     m_commandList->SetDescriptorHeaps(1, heaps);
+    return true;
 }
 
-void D3D12Device::endFrame(bool vsyncEnabled) {
-    m_commandList->Close();
+bool D3D12Device::endFrame(bool vsyncEnabled) {
+    if (!m_frameRecording || !m_commandList || !m_commandQueue || !m_swapChain) {
+        std::cerr << "[D3D12 Error] Cannot end frame: there is no active frame or a required object is unavailable.\n";
+        return false;
+    }
+    const HRESULT closeResult = m_commandList->Close();
+    m_frameRecording = false;
+    if (FAILED(closeResult)) {
+        std::cerr << "[D3D12 Error] Command list Close failed: HRESULT 0x"
+                  << std::hex << closeResult << std::dec << ".\n";
+        return false;
+    }
     ID3D12CommandList* lists[] = { m_commandList.Get() };
     m_commandQueue->ExecuteCommandLists(1, lists);
 
     const UINT presentFlags = (!vsyncEnabled && m_tearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
-    m_swapChain->Present(vsyncEnabled ? 1 : 0, presentFlags);
-    moveToNextFrame();
+    const HRESULT presentResult = m_swapChain->Present(vsyncEnabled ? 1 : 0, presentFlags);
+    if (FAILED(presentResult)) {
+        std::cerr << "[DXGI Error] Swap-chain Present failed: HRESULT 0x"
+                  << std::hex << presentResult << std::dec << ".\n";
+    }
+    const bool frameAdvanced = moveToNextFrame();
+    return SUCCEEDED(presentResult) && frameAdvanced;
 }
 
 } // namespace Engine

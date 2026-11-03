@@ -28,8 +28,8 @@ public:
     bool init(HWND hwnd, uint32_t width, uint32_t height);
     void shutdown();
 
-    void waitForGpu();
-    void moveToNextFrame();
+    bool waitForGpu();
+    bool moveToNextFrame();
 
     bool resize(uint32_t width, uint32_t height);
 
@@ -54,8 +54,9 @@ public:
     void transitionBarrier(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after);
     void uavBarrier(ID3D12Resource* resource);
 
-    void beginFrame();
-    void endFrame(bool vsyncEnabled = false);
+    bool beginFrame();
+    bool endFrame(bool vsyncEnabled = false);
+    bool isFrameRecording() const { return m_frameRecording; }
 
     std::string getGpuName() const { return m_gpuName; }
     D3D12_RAYTRACING_TIER getRaytracingTier() const { return m_raytracingTier; }
@@ -77,6 +78,8 @@ private:
     uint64_t                            m_fenceValues[FRAME_COUNT] = {};
     uint64_t                            m_currentFence = 0;
     uint32_t                            m_frameIndex = 0;
+    bool                                m_frameRecording = false;
+    bool                                m_shutdown = false;
 
     uint32_t                            m_rtvDescriptorSize = 0;
     uint32_t                            m_srvUavDescriptorSize = 0;

@@ -59,6 +59,7 @@ bool Window::create(const std::wstring& title, uint32_t width, uint32_t height) 
 
 bool Window::pollEvents() {
     m_mouseDelta = Vec2(0.0f, 0.0f);
+    for (bool& pressed : m_mousePressed) pressed = false;
     MSG msg;
     while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) {
@@ -78,6 +79,11 @@ bool Window::isKeyDown(int vk) const {
 
 bool Window::isMouseButtonDown(int button) const {
     if (button >= 0 && button < 3) return m_mouseButtons[button];
+    return false;
+}
+
+bool Window::wasMouseButtonPressed(int button) const {
+    if (button >= 0 && button < 3) return m_mousePressed[button];
     return false;
 }
 
@@ -106,21 +112,33 @@ LRESULT CALLBACK Window::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
 
     case WM_LBUTTONDOWN:
-        if (w) w->m_mouseButtons[0] = true;
+        if (w) {
+            w->m_mouseButtons[0] = true;
+            w->m_mousePressed[0] = true;
+            w->m_mousePos = Vec2(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+        }
         return 0;
     case WM_LBUTTONUP:
         if (w) w->m_mouseButtons[0] = false;
         return 0;
 
     case WM_RBUTTONDOWN:
-        if (w) w->m_mouseButtons[1] = true;
+        if (w) {
+            w->m_mouseButtons[1] = true;
+            w->m_mousePressed[1] = true;
+            w->m_mousePos = Vec2(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+        }
         return 0;
     case WM_RBUTTONUP:
         if (w) w->m_mouseButtons[1] = false;
         return 0;
 
     case WM_MBUTTONDOWN:
-        if (w) w->m_mouseButtons[2] = true;
+        if (w) {
+            w->m_mouseButtons[2] = true;
+            w->m_mousePressed[2] = true;
+            w->m_mousePos = Vec2(static_cast<float>(GET_X_LPARAM(lParam)), static_cast<float>(GET_Y_LPARAM(lParam)));
+        }
         return 0;
     case WM_MBUTTONUP:
         if (w) w->m_mouseButtons[2] = false;

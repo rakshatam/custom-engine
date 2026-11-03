@@ -35,9 +35,10 @@ public:
     bool initReflectionLab(D3D12Device& device, const std::string& gltfPath);
     void update(float dt, const Window& window, float viewportX, float viewportY, float viewportW, float viewportH,
                 float renderAspect, uint32_t renderHeight, uint32_t frameIndex);
-    void updateGpuBuffers(D3D12Device& device);
+    bool updateGpuBuffers(D3D12Device& device, std::string* failureReason = nullptr);
 
-    EntityID rayPick(float screenX, float screenY, float viewportW, float viewportH);
+    EntityID rayPick(float screenX, float screenY, float viewportW, float viewportH,
+                     Vec3* outLocalHit = nullptr);
 
     CameraComponent& getCamera() { return m_camera; }
     const CameraComponent& getCamera() const { return m_camera; }
@@ -52,8 +53,10 @@ public:
     const std::vector<SceneEntity>& getEntities() const { return m_entities; }
 
     SceneEntity* getEntity(EntityID id);
+    const SceneEntity* getEntity(EntityID id) const;
     EntityID getSelectedEntityId() const { return m_selectedEntityId; }
-    void setSelectedEntityId(EntityID id);
+    Vec3 getSelectedEntityLocalAnchor() const;
+    void setSelectedEntityId(EntityID id, const Vec3* localAnchor = nullptr);
     bool updateEntityMaterial(EntityID id);
 
     Tlas& getTlas() { return m_tlas; }
@@ -72,6 +75,7 @@ public:
     void markTransformsDirty() { m_transformsDirty = true; }
 
     uint32_t getTextureArraySrvIndex() const { return m_textureArraySrvIndex; }
+    uint32_t getEnvironmentSrvIndex() const { return m_environmentSrvIndex; }
     uint32_t getAccumFrameCount() const { return m_accumFrameCount; }
     void resetAccumulation() {
         m_accumFrameCount = 1;
@@ -108,6 +112,7 @@ private:
     void buildProceduralSponza(std::vector<Vertex>& outVertices, std::vector<uint32_t>& outIndices);
     bool createTextureArray(D3D12Device& device, const std::vector<std::string>& textureUris,
                             const std::vector<uint8_t>& srgbLayers);
+    bool createEnvironmentMaps(D3D12Device& device, const std::string& hdrPath, float intensity);
     bool uploadGpuScene(D3D12Device& device);
     bool rebuildEntityIndex();
     void updateOceanPhysics(float dt);
@@ -115,11 +120,16 @@ private:
     std::vector<SceneEntity> m_entities;
     EntityIndex m_entityIndex;
     EntityID m_selectedEntityId = NULL_ENTITY;
+    Vec3 m_selectedLocalAnchor = Vec3(0.0f);
+    bool m_hasSelectedLocalAnchor = false;
     EntityID m_nextEntityId = 1;
 
     CameraComponent m_camera;
     LightComponent  m_sun;
     SceneCB         m_sceneCbData = {};
+    Vec3            m_importedCameraPosition = Vec3(0.0f);
+    Vec3            m_importedCameraForward = Vec3(0.0f, 0.0f, 1.0f);
+    bool            m_hasImportedCamera = false;
 
     std::vector<Vertex>       m_allVertices;
     std::vector<uint32_t>     m_allIndices;
@@ -137,6 +147,10 @@ private:
     uint32_t                  m_sceneCbFrameIndex = 0;
     ComPtr<ID3D12Resource>    m_textureArray;
     uint32_t                  m_textureArraySrvIndex = 0;
+    uint32_t                  m_textureArrayLayerCount = 0;
+    ComPtr<ID3D12Resource>    m_environmentMap;
+    ComPtr<ID3D12Resource>    m_environmentIrradiance;
+    uint32_t                  m_environmentSrvIndex = UINT32_MAX;
 
     uint32_t m_totalTriangles = 0;
     size_t   m_materialBufferCapacity = 0;
@@ -162,6 +176,7 @@ private:
     bool     m_cameraMoved = false;
     bool     m_isOceanScene = false;
     bool     m_isReflectionLabScene = false;
+    uint32_t m_textureArrayResolution = 1024;
     bool     m_loadedSourceAsset = false;
     bool     m_freezeSampleSeedForValidation = false;
     float    m_oceanTime = 0.0f;

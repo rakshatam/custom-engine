@@ -1,5 +1,5 @@
-cmake_minimum_required(VERSION 3.20)
-project(CustomRayTracingEngine LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.30)
+project(CustomRayTracingEngine VERSION 0.1.0 LANGUAGES C CXX)
 
 if(NOT WIN32)
     message(FATAL_ERROR "CustomRayTracingEngine requires Windows, Direct3D 12, and DXR.")
@@ -12,6 +12,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 option(ENGINE_ENABLE_NRD "Build NVIDIA NRD and NRI for path-tracing denoising" ON)
+option(ENGINE_ENABLE_DLSS "Build NVIDIA DLSS Super Resolution and Ray Reconstruction through NGX" ON)
+
+if(ENGINE_ENABLE_DLSS)
+    include(FetchContent)
+    FetchContent_Declare(
+        ngx
+        DOWNLOAD_EXTRACT_TIMESTAMP 1
+        DOWNLOAD_NO_PROGRESS 1
+        SOURCE_SUBDIR "ignore CMakeLists.txt"
+        URL "https://github.com/NVIDIA/DLSS/archive/refs/tags/v310.9.1.zip"
+    )
+    FetchContent_MakeAvailable(ngx)
+endif()
+
 if(ENGINE_ENABLE_NRD)
     # NVIDIA's current NRD/NRI SDKs require CMake 3.30+. Limit NRI to the D3D12
     # backend used by this engine and avoid fetching unrelated vendor SDKs.
@@ -28,6 +42,9 @@ if(ENGINE_ENABLE_NRD)
     set(NRI_ENABLE_AMDAGS OFF CACHE BOOL "" FORCE)
     set(NRI_ENABLE_AGILITY_SDK_SUPPORT OFF CACHE BOOL "" FORCE)
     set(NRD_STATIC_LIBRARY ON CACHE BOOL "" FORCE)
+    if(ENGINE_ENABLE_DLSS)
+        set(NRI_ENABLE_NGX_SDK ON CACHE BOOL "" FORCE)
+    endif()
     set(NRD_NRI ON CACHE BOOL "" FORCE)
     set(NRD_EMBEDS_DXIL_SHADERS ON CACHE BOOL "" FORCE)
     set(NRD_EMBEDS_SPIRV_SHADERS OFF CACHE BOOL "" FORCE)
@@ -75,6 +92,7 @@ add_custom_command(
     COMMENT "Building the isolated C ABI bridge to MSYS2 Jolt 5.3"
     VERBATIM
 )
+
 add_custom_target(JoltBridgeBuild ALL DEPENDS "${JOLT_BRIDGE_DLL}")
 
 set(_WINDOWS_KIT_DXC_HINTS)
@@ -98,12 +116,17 @@ if(ENGINE_ENABLE_NRD)
     file(GLOB_RECURSE NRD_HLSL_INCLUDE_DEPENDENCIES CONFIGURE_DEPENDS
         "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvidia/NRD/Shaders/*.hlsli")
 endif()
+set(RAY_TRACING_DXC_DLSS_ARGS -D ENGINE_ENABLE_DLSS=0)
+if(ENGINE_ENABLE_DLSS)
+    set(RAY_TRACING_DXC_DLSS_ARGS -D ENGINE_ENABLE_DLSS=1)
+endif()
 add_custom_command(
     OUTPUT "${RAY_TRACING_BYTECODE_HEADER}"
     BYPRODUCTS "${RAY_TRACING_DXIL}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_SHADER_DIR}"
     COMMAND "${DXC_EXECUTABLE}" -T lib_6_5 -O3
         ${RAY_TRACING_DXC_NRD_ARGS}
+        ${RAY_TRACING_DXC_DLSS_ARGS}
         -Fo "${RAY_TRACING_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/RayTracingPBR.hlsl"
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_dxil.py" "${RAY_TRACING_DXIL}" "${RAY_TRACING_BYTECODE_HEADER}"
     DEPENDS
@@ -117,11 +140,16 @@ add_custom_command(
 if(ENGINE_ENABLE_NRD)
     set(NRD_COMPOSITE_DXIL "${GENERATED_SHADER_DIR}/NrdComposite.dxil")
     set(NRD_COMPOSITE_BYTECODE_HEADER "${GENERATED_SHADER_DIR}/NrdComposite_Bytecode.h")
+    set(NRD_COMPOSITE_DXC_DLSS_ARGS -D ENGINE_ENABLE_DLSS=0)
+    if(ENGINE_ENABLE_DLSS)
+        set(NRD_COMPOSITE_DXC_DLSS_ARGS -D ENGINE_ENABLE_DLSS=1)
+    endif()
     add_custom_command(
         OUTPUT "${NRD_COMPOSITE_BYTECODE_HEADER}"
         BYPRODUCTS "${NRD_COMPOSITE_DXIL}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E main -O3
+            ${NRD_COMPOSITE_DXC_DLSS_ARGS}
             -I "${CMAKE_CURRENT_SOURCE_DIR}/vendor/nvidia/NRD/Shaders"
             -Fo "${NRD_COMPOSITE_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/NrdComposite.hlsl"
         COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_dxil.py"
@@ -131,6 +159,25 @@ if(ENGINE_ENABLE_NRD)
             ${NRD_HLSL_INCLUDE_DEPENDENCIES}
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_dxil.py"
         COMMENT "Compiling the NRD output composition shader"
+        VERBATIM
+    )
+endif()
+
+if(ENGINE_ENABLE_DLSS)
+    set(DLSS_COMPOSITE_DXIL "${GENERATED_SHADER_DIR}/DlssComposite.dxil")
+    set(DLSS_COMPOSITE_BYTECODE_HEADER "${GENERATED_SHADER_DIR}/DlssComposite_Bytecode.h")
+    add_custom_command(
+        OUTPUT "${DLSS_COMPOSITE_BYTECODE_HEADER}"
+        BYPRODUCTS "${DLSS_COMPOSITE_DXIL}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${GENERATED_SHADER_DIR}"
+        COMMAND "${DXC_EXECUTABLE}" -T cs_6_5 -E main -O3
+            -Fo "${DLSS_COMPOSITE_DXIL}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/DlssComposite.hlsl"
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_dxil.py"
+            "${DLSS_COMPOSITE_DXIL}" "${DLSS_COMPOSITE_BYTECODE_HEADER}"
+        DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/shaders/DlssComposite.hlsl"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed_dxil.py"
+        COMMENT "Compiling DLSS HDR output composition shader"
         VERBATIM
     )
 endif()
@@ -170,6 +217,9 @@ set(ENGINE_HEADERS
     src/editor/EditorUI.h
     "${RAY_TRACING_BYTECODE_HEADER}"
 )
+if(ENGINE_ENABLE_DLSS)
+    list(APPEND ENGINE_HEADERS "${DLSS_COMPOSITE_BYTECODE_HEADER}")
+endif()
 if(ENGINE_ENABLE_NRD)
     list(APPEND ENGINE_HEADERS "${NRD_COMPOSITE_BYTECODE_HEADER}")
 endif()
@@ -188,7 +238,9 @@ target_include_directories(CustomEngine PRIVATE
     vendor/nvidia/NRD/Integration
     "${ASSIMP_INCLUDE_DIR}"
 )
-target_compile_definitions(CustomEngine PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(CustomEngine PRIVATE
+    NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
+    ENGINE_VERSION_STRING="${PROJECT_VERSION}")
 target_link_libraries(CustomEngine PRIVATE
     d3d12.lib
     dxgi.lib
@@ -203,6 +255,27 @@ if(ENGINE_ENABLE_NRD)
     target_compile_definitions(CustomEngine PRIVATE ENGINE_ENABLE_NRD=1)
 else()
     target_compile_definitions(CustomEngine PRIVATE ENGINE_ENABLE_NRD=0)
+endif()
+
+if(ENGINE_ENABLE_DLSS)
+    # Use FetchContent's resolved source path so a developer-provided local SDK
+    # source override works as well as the default build-local download.
+    set(DLSS_INCLUDE_DIR "${ngx_SOURCE_DIR}/include")
+    set(DLSS_LIB_DIR "${ngx_SOURCE_DIR}/lib/Windows_x86_64/x64")
+    if(NOT EXISTS "${DLSS_INCLUDE_DIR}/nvsdk_ngx.h")
+        message(FATAL_ERROR "NVIDIA DLSS SDK headers were not populated at ${DLSS_INCLUDE_DIR}")
+    endif()
+    target_include_directories(CustomEngine PRIVATE "${DLSS_INCLUDE_DIR}")
+    target_compile_definitions(CustomEngine PRIVATE ENGINE_ENABLE_DLSS=1)
+    target_link_libraries(CustomEngine PRIVATE "${DLSS_LIB_DIR}/nvsdk_ngx_d$<$<CONFIG:Debug>:_dbg>.lib")
+    set(DLSS_RUNTIME_DIR "${ngx_SOURCE_DIR}/lib/Windows_x86_64/$<IF:$<CONFIG:Debug>,dev,rel>")
+    add_custom_command(TARGET CustomEngine POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${DLSS_RUNTIME_DIR}/nvngx_dlss.dll" "$<TARGET_FILE_DIR:CustomEngine>"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${DLSS_RUNTIME_DIR}/nvngx_dlssd.dll" "$<TARGET_FILE_DIR:CustomEngine>"
+        VERBATIM
+    )
+else()
+    target_compile_definitions(CustomEngine PRIVATE ENGINE_ENABLE_DLSS=0)
 endif()
 
 if(MSVC)

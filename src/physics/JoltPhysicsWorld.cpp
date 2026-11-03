@@ -17,11 +17,25 @@ JoltPhysicsWorld::~JoltPhysicsWorld() {
 bool JoltPhysicsWorld::initialize() {
     if (m_world) return true;
     wchar_t executablePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, executablePath, MAX_PATH);
+    const DWORD executablePathLength = GetModuleFileNameW(nullptr, executablePath, MAX_PATH);
+    if (executablePathLength == 0 || executablePathLength >= MAX_PATH) {
+        std::cerr << "[Jolt] Could not resolve the executable directory (GetModuleFileNameW="
+                  << executablePathLength << ", error=" << GetLastError() << ")." << std::endl;
+        return false;
+    }
     wchar_t* lastSlash = wcsrchr(executablePath, L'\\');
-    if (lastSlash) *(lastSlash + 1) = L'\0';
+    if (!lastSlash) {
+        std::cerr << "[Jolt] Executable path did not contain a directory separator." << std::endl;
+        return false;
+    }
+    *(lastSlash + 1) = L'\0';
     std::wstring runtimeDirectory = std::wstring(executablePath) + L"jolt_runtime";
     m_dllDirectoryCookie = AddDllDirectory(runtimeDirectory.c_str());
+    if (!m_dllDirectoryCookie) {
+        std::cerr << "[Jolt] Could not add the staged runtime search directory (error="
+                  << GetLastError() << ")." << std::endl;
+        return false;
+    }
     std::wstring bridgePath = std::wstring(executablePath) + L"JoltBridge.dll";
     m_module = LoadLibraryExW(bridgePath.c_str(), nullptr,
         LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_USER_DIRS);
@@ -43,6 +57,15 @@ bool JoltPhysicsWorld::initialize() {
         std::cerr << "[Jolt] Bridge exports are incomplete." << std::endl;
         FreeLibrary(m_module);
         m_module = nullptr;
+        m_createWorld = nullptr;
+        m_destroyWorld = nullptr;
+        m_addFloatBody = nullptr;
+        m_step = nullptr;
+        m_getBodyCount = nullptr;
+        m_getBodyTransform = nullptr;
+        m_getBodyLinearVelocity = nullptr;
+        m_getWaterSurface = nullptr;
+        m_registerWaterImpact = nullptr;
         if (m_dllDirectoryCookie) { RemoveDllDirectory(m_dllDirectoryCookie); m_dllDirectoryCookie = nullptr; }
         return false;
     }
@@ -51,6 +74,15 @@ bool JoltPhysicsWorld::initialize() {
         std::cerr << "[Jolt] PhysicsSystem creation failed." << std::endl;
         FreeLibrary(m_module);
         m_module = nullptr;
+        m_createWorld = nullptr;
+        m_destroyWorld = nullptr;
+        m_addFloatBody = nullptr;
+        m_step = nullptr;
+        m_getBodyCount = nullptr;
+        m_getBodyTransform = nullptr;
+        m_getBodyLinearVelocity = nullptr;
+        m_getWaterSurface = nullptr;
+        m_registerWaterImpact = nullptr;
         if (m_dllDirectoryCookie) { RemoveDllDirectory(m_dllDirectoryCookie); m_dllDirectoryCookie = nullptr; }
         return false;
     }

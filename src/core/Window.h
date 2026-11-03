@@ -29,6 +29,7 @@ public:
 
     bool isKeyDown(int vk) const;
     bool isMouseButtonDown(int button) const; // 0 = Left, 1 = Right
+    bool wasMouseButtonPressed(int button) const;
     Vec2 getMousePos() const { return m_mousePos; }
     Vec2 getMouseDelta() const { return m_mouseDelta; }
     void resetMouseDelta() { m_mouseDelta = Vec2(0.0f, 0.0f); }
@@ -45,6 +46,7 @@ private:
 
     bool m_keys[256] = {};
     bool m_mouseButtons[3] = {};
+    bool m_mousePressed[3] = {};
     Vec2 m_mousePos = {};
     Vec2 m_prevMousePos = {};
     Vec2 m_mouseDelta = {};

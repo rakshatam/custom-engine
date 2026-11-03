@@ -22,14 +22,17 @@ struct MaterialData {
     int    textureId;
     int    metallicRoughnessTextureId;
     float  alphaCutoff;
-    float2 pad;
+    int    normalTextureId;
+    int    emissiveTextureId;
+    float4 emissiveColor;
+    float4 dielectric; // x: transmission, y: IOR
+    float4 volumeAbsorption;
 };
 
 struct InstanceData {
     uint materialId;
     uint vertexOffset;
     uint indexOffset;
-    uint pad;
 };
 
 struct SceneCB {
@@ -59,24 +62,33 @@ struct SceneCB {
     float3   prevCameraPos;
     uint     enableShadows;
     float3   prevCamForward;
-    float    padPrev1;
+    float    prevJitterX;
     float3   prevCamRight;
     float    enableRayTracedReflections;
     float3   prevCamUp;
-    float    padPrev3;
+    float    prevJitterY;
     float2   jitterOffset;
     uint     enableTAA;
     float    taaBlendWeight;
     uint     enableNRD;
     uint     renderHeight;
     uint     oceanBodyCount;
-    float    oceanPadAlignment;
-    float3   oceanPad;
-    float    oceanPadAlignment2;
+    float    waterReflectionStrength;
+    uint     enableDLSS;
+    uint     enableDLSSRR;
+    uint     dlssReset;
+    uint     textureArrayResolution;
+    float2   cameraClipPlanes;
+    float    oceanTime;
+    float    ambientMultiplier;
     float4   oceanBodyPositionRadius[8];
     float4   oceanBodyVelocityImpact[8];
     float4   oceanBodyImpactPositionRadius[8];
     float4   oceanBodyVerticalState[8];
+    float    environmentIntensity;
+    uint     environmentMapEnabled;
+    float    environmentMapMaxMip;
+    uint     environmentPadding;
 };
 
 // Global Resources
@@ -85,11 +97,22 @@ RWTexture2D<float4>             g_Output         : register(u0);
 RWTexture2D<float4>             g_Accumulation   : register(u1);
 RWTexture2D<float4>             g_History        : register(u2);
 #if ENGINE_ENABLE_NRD
-RWTexture2D<float4>             g_NrdSignal      : register(u3);
-RWTexture2D<float4>             g_NrdNormalRoughness : register(u4);
-RWTexture2D<float>              g_NrdViewZ       : register(u5);
-RWTexture2D<float4>             g_NrdMotion      : register(u6);
-RWTexture2D<float4>             g_NrdAlbedo      : register(u7);
+RWTexture2D<float4>             g_NrdDiffuseSignal : register(u3);
+RWTexture2D<float4>             g_NrdSpecularSignal : register(u4);
+RWTexture2D<float4>             g_NrdNormalRoughness : register(u5);
+RWTexture2D<float>              g_NrdViewZ       : register(u6);
+RWTexture2D<float4>             g_NrdMotion      : register(u7);
+RWTexture2D<float4>             g_NrdDiffuseFactor : register(u8);
+RWTexture2D<float4>             g_NrdSpecularFactor : register(u9);
+#endif
+#if ENGINE_ENABLE_DLSS
+RWTexture2D<float4>             g_DLSSInputColor : register(u10);
+RWTexture2D<float>              g_DLSSDepth : register(u11);
+RWTexture2D<float2>             g_DLSSMotionVectors : register(u12);
+RWTexture2D<float4>             g_DLSSNormalRoughness : register(u13);
+RWTexture2D<float4>             g_DLSSDiffuseAlbedo : register(u14);
+RWTexture2D<float4>             g_DLSSSpecularAlbedo : register(u15);
+RWTexture2D<float>              g_DLSSSpecularHitDistance : register(u16);
 #endif
 ConstantBuffer<SceneCB>         g_SceneCB        : register(b0);
 StructuredBuffer<Vertex>        g_Vertices       : register(t1);
@@ -97,7 +120,10 @@ StructuredBuffer<uint>          g_Indices        : register(t2);
 StructuredBuffer<MaterialData>  g_Materials      : register(t3);
 StructuredBuffer<InstanceData>  g_Instances      : register(t4);
 Texture2DArray<float4>          g_Textures       : register(t5);
+Texture2D<float4>               g_EnvironmentRadiance : register(t6);
+Texture2D<float4>               g_EnvironmentIrradiance : register(t7);
 SamplerState                    g_LinearSampler  : register(s0);
+SamplerState                    g_EnvironmentSampler : register(s1);
 
 // Payload structures
 struct RayPayload {
@@ -105,17 +131,25 @@ struct RayPayload {
     float3 albedo;
     float3 normal;
     float3 hitPos;
-    float3 nonDiffuseRadiance;
+    float3 specularRadiance;
+    float3 emissiveRadiance;
+    float3 specularF0;
     float  hitT;
     float  roughness;
-    // Packed 32-bit stream: 24-bit sample index, 7-bit dimension, 1-bit
-    // reflection marker. The separate non-diffuse output keeps NRD's input typed.
+    float  specularHitDistance;
+    float  metallic;
+    // Packed stream: 24-bit sample index, 6-bit Sobol dimension, plus the
+    // primary-path and reflected-ray flags in bits 30 and 31.
     uint   sampleSeed;
     uint   sampleStream;
-};
-
-struct ShadowPayload {
-    float visibility;
+    // Spatial 2x2 checkerboard phase used for sparse specular rays and NRD's
+    // 3x3 hit-distance reconstruction. It changes phase with the sample index.
+    uint   reflectionPixelParity;
+    uint   transmissionState; // 0: ordinary ray, 2: transmitted ray excluding its source instance, 3: stop path at dielectric.
+    uint   transmissionInstanceId;
+    // Shadow traversal shares this payload ABI with AnyHitShader so alpha-test
+    // rays never interpret a smaller, incompatible payload as RayPayload.
+    float  visibility;
 };
 
 // PCG Random Number Generator
@@ -371,12 +405,12 @@ float3 evaluateSky(float3 rayDir, bool includeSolarDisk) {
     float t = saturate((rayDir.y + 0.1f) / 1.1f);
     float3 sky = lerp(g_SceneCB.skyHorizonColor.rgb, g_SceneCB.skyZenithColor.rgb, pow(t, 0.55f));
 
-    if (g_SceneCB.padPrev3 > 2.0f) {
+    if (g_SceneCB.ambientMultiplier > 2.0f) {
         const float horizonHaze = exp(-abs(rayDir.y) * 24.0f);
         sky = lerp(sky, float3(0.43f, 0.53f, 0.59f), horizonHaze * 0.34f);
         const float2 cloudUv = rayDir.xz / max(rayDir.y + 0.20f, 0.075f);
-        const float cloudShape = oceanCloudFbm(cloudUv * 1.45f + float2(g_SceneCB.padPrev1 * 0.004f, 0.0f));
-        const float cloudDetail = oceanCloudFbm(cloudUv * 3.6f - float2(0.0f, g_SceneCB.padPrev1 * 0.009f));
+        const float cloudShape = oceanCloudFbm(cloudUv * 1.45f + float2(g_SceneCB.oceanTime * 0.004f, 0.0f));
+        const float cloudDetail = oceanCloudFbm(cloudUv * 3.6f - float2(0.0f, g_SceneCB.oceanTime * 0.009f));
         const float cloudCoverage = smoothstep(0.40f, 0.56f, cloudShape);
         const float cloudLayer = smoothstep(-0.045f, 0.08f, rayDir.y)
                                * (1.0f - 0.35f * smoothstep(0.55f, 0.95f, rayDir.y));
@@ -396,6 +430,35 @@ float3 evaluateSky(float3 rayDir, bool includeSolarDisk) {
         }
     }
     return sky;
+}
+
+float2 environmentDirectionToUv(float3 direction) {
+    const float3 d = safeNormalize(direction, float3(0.0f, 1.0f, 0.0f));
+    return float2(atan2(d.z, d.x) / (2.0f * PI) + 0.5f,
+                  acos(clamp(d.y, -1.0f, 1.0f)) / PI);
+}
+
+float3 sampleSceneEnvironment(float3 direction, float roughness, bool includeSolarDisk) {
+    if (g_SceneCB.environmentMapEnabled != 0u) {
+        const float lod = saturate(roughness) * max(g_SceneCB.environmentMapMaxMip, 0.0f);
+        const float3 radiance = g_EnvironmentRadiance.SampleLevel(
+            g_EnvironmentSampler, environmentDirectionToUv(direction), lod).rgb;
+        return max(radiance, 0.0f) * max(g_SceneCB.environmentIntensity, 0.0f);
+    }
+    return evaluateSky(direction, includeSolarDisk);
+}
+
+float3 sampleSceneDiffuseEnvironment(float3 normal) {
+    if (g_SceneCB.environmentMapEnabled != 0u) {
+        const float3 irradianceOverPi = g_EnvironmentIrradiance.SampleLevel(
+            g_EnvironmentSampler, environmentDirectionToUv(normal), 0.0f).rgb;
+        return max(irradianceOverPi, 0.0f) * max(g_SceneCB.environmentIntensity, 0.0f);
+    }
+    const float skyHemi = saturate(0.5f + 0.5f * normal.y);
+    const float3 skyLight = lerp(g_SceneCB.skyHorizonColor.rgb * 0.55f,
+        g_SceneCB.skyZenithColor.rgb, skyHemi) * skyHemi * 0.32f;
+    const float3 ambientRecess = g_SceneCB.skyZenithColor.rgb * 0.04f;
+    return skyLight + ambientRecess;
 }
 
 // Microfacet Cook-Torrance GGX PBR Functions
@@ -530,8 +593,10 @@ float getLuminance(float3 color) {
 // footprint from the ray cone and triangle UV/world area, then select the
 // corresponding mip explicitly instead of forcing every texture hit to LOD 0.
 float estimateTextureLod(Vertex v0, Vertex v1, Vertex v2, float hitDistance) {
-    const float3 edge1 = mul((float3x3)ObjectToWorld4x3(), v1.position - v0.position);
-    const float3 edge2 = mul((float3x3)ObjectToWorld4x3(), v2.position - v0.position);
+    // ObjectToWorld4x3 is the transpose of the 3x4 object-to-world matrix.
+    // Here vectors are multiplied as columns, so use the 3x4 form directly.
+    const float3 edge1 = mul((float3x3)ObjectToWorld3x4(), v1.position - v0.position);
+    const float3 edge2 = mul((float3x3)ObjectToWorld3x4(), v2.position - v0.position);
     const float worldArea = 0.5f * length(cross(edge1, edge2));
     const float2 uv1 = v1.uv - v0.uv;
     const float2 uv2 = v2.uv - v0.uv;
@@ -539,8 +604,15 @@ float estimateTextureLod(Vertex v0, Vertex v1, Vertex v2, float hitDistance) {
     const float uvDensity = sqrt(uvArea / max(worldArea, 1.0e-8f));
     const float pixelConeWidth = max(hitDistance, 0.0f) * 2.0f * tan(g_SceneCB.fovY * 0.5f)
                                / max((float)g_SceneCB.renderHeight, 1.0f);
-    const float footprintInTexels = pixelConeWidth * uvDensity * 1024.0f;
-    return clamp(log2(max(footprintInTexels, 1.0f)), 0.0f, 10.0f);
+    const float footprintInTexels = pixelConeWidth * uvDensity *
+        max((float)g_SceneCB.textureArrayResolution, 1.0f);
+    const float maximumMip = log2(max((float)g_SceneCB.textureArrayResolution, 1.0f));
+    return clamp(log2(max(footprintInTexels, 1.0f)), 0.0f, maximumMip);
+}
+
+float4 sampleMaterialTexture(int textureId, float2 uv, float baseArrayLod) {
+    if (textureId < 0) return float4(1.0f, 1.0f, 1.0f, 1.0f);
+    return g_Textures.SampleLevel(g_LinearSampler, float3(uv, textureId), baseArrayLod);
 }
 
 // -------------------------------------------------------------
@@ -588,15 +660,20 @@ void RayGenShader() {
 
     float3 throughput = float3(1.0f, 1.0f, 1.0f);
     float3 totalRadiance = float3(0.0f, 0.0f, 0.0f);
+    float3 previousBounceNormal = float3(0.0f, 1.0f, 0.0f);
 
     float3 primaryHitPos = float3(0.0f, 0.0f, 0.0f);
     float  primaryHitT   = -1.0f;
     float3 primaryDirectRadiance = float3(0.0f, 0.0f, 0.0f);
-    float3 primaryNonDiffuseRadiance = float3(0.0f, 0.0f, 0.0f);
+    float3 primarySpecularRadiance = float3(0.0f, 0.0f, 0.0f);
+    float3 primaryEmissiveRadiance = float3(0.0f, 0.0f, 0.0f);
+    float3 primarySpecularF0 = float3(0.04f, 0.04f, 0.04f);
+    float primarySpecularHitDistance = 0.0f;
     float  firstIndirectHitDistance = 0.0f;
     float  primaryRoughness = 1.0f;
     float3 primaryNormal = float3(0.0f, 1.0f, 0.0f);
     float3 primaryAlbedo = float3(1.0f, 1.0f, 1.0f);
+    float primaryMetallic = 0.0f;
 
     // Maximum depth for path tracing:
     // renderMode: 0 = Path Traced GI, 1 = Direct + RT Shadows, 2 = Normals, 3 = Albedo
@@ -608,11 +685,18 @@ void RayGenShader() {
         payload.albedo = float3(0.0f, 0.0f, 0.0f);
         payload.normal = float3(0.0f, 0.0f, 0.0f);
         payload.hitPos = float3(0.0f, 0.0f, 0.0f);
-        payload.nonDiffuseRadiance = float3(0.0f, 0.0f, 0.0f);
+        payload.specularRadiance = float3(0.0f, 0.0f, 0.0f);
+        payload.emissiveRadiance = float3(0.0f, 0.0f, 0.0f);
+        payload.specularF0 = float3(0.04f, 0.04f, 0.04f);
         payload.hitT = -1.0f;
         payload.roughness = 1.0f;
+        payload.specularHitDistance = 0.0f;
+        payload.metallic = 0.0f;
         payload.sampleSeed = sampleSeed;
         payload.sampleStream = sampleStream | (bounce == 0u ? 0x40000000u : 0u);
+        payload.reflectionPixelParity = (launchIndex.x + launchIndex.y) & 1u;
+        payload.transmissionState = 0u;
+        payload.transmissionInstanceId = 0xffffffffu;
 
         TraceRay(
             g_Scene,
@@ -630,13 +714,27 @@ void RayGenShader() {
             primaryRoughness = payload.roughness;
             primaryNormal = payload.normal;
             primaryAlbedo = payload.albedo;
-            primaryNonDiffuseRadiance = payload.nonDiffuseRadiance;
+            primaryMetallic = payload.metallic;
+            primarySpecularRadiance = payload.specularRadiance;
+            primaryEmissiveRadiance = payload.emissiveRadiance;
+            primarySpecularF0 = payload.specularF0;
+            primarySpecularHitDistance = payload.specularHitDistance;
         }
 
-        // If ray missed geometry, add environment / sky light and terminate path
+        // If a diffuse path ray misses, integrate the environment over the
+        // previous surface's cosine hemisphere instead of sampling one HDR
+        // texel. This is the conditional expectation of cosine-weighted
+        // sampling: E[L] = (1/PI) * integral_H L(w) * (N.w) dw. The HDR
+        // irradiance map stores that integral / PI, removing high-variance
+        // bright texels. Keep directional sky sampling for analytic skies,
+        // whose existing diffuse approximation is not this exact integral.
         if (payload.hitT < 0.0f) {
-            totalRadiance += throughput * payload.color;
-            if (bounce == 0) primaryDirectRadiance = payload.color;
+            const float3 missRadiance = (g_SceneCB.renderMode == 0u && bounce > 0u &&
+                g_SceneCB.environmentMapEnabled != 0u)
+                ? sampleSceneDiffuseEnvironment(previousBounceNormal)
+                : payload.color;
+            totalRadiance += throughput * missRadiance;
+            if (bounce == 0) primaryDirectRadiance = missRadiance;
             break;
         }
 
@@ -646,23 +744,22 @@ void RayGenShader() {
             break;
         }
 
-        // Add emitted + direct reflected radiance from this hit point
-        float3 hitRadiance = payload.color;
-        if (bounce > 0) {
-            // Secondary bounce GI: clamp fireflies to avoid extreme outlier grain
-            hitRadiance = min(hitRadiance, float3(3.0f, 3.0f, 3.0f)) * 0.5f;
-        }
-        totalRadiance += throughput * hitRadiance;
+        // Each hit contributes its complete emitted and direct outgoing radiance.
+        // The estimator is not biased by a fixed secondary-ray clamp or scale.
+        totalRadiance += throughput * payload.color;
         if (bounce == 0) {
-            primaryDirectRadiance = hitRadiance;
+            primaryDirectRadiance = payload.color;
         } else {
             if (bounce == 1) firstIndirectHitDistance = max(payload.hitT, 0.0f);
         }
+        if (payload.transmissionState == 3u) break;
 
         // Stop if maximum bounce reached
         if (bounce >= maxBounces) {
             break;
         }
+
+        previousBounceNormal = payload.normal;
 
         // Stochastic diffuse GI bounce via Cosine-Weighted Hemisphere Sampling
         float3 bounceDir = getCosineHemisphereSample(payload.normal, sampleStream, sampleSeed);
@@ -671,9 +768,14 @@ void RayGenShader() {
             break;
         }
 
-        // Throughput update: (BRDF * dot(N, L)) / PDF
-        // For diffuse Lambertian: BRDF = albedo / PI, PDF = dot(N, L) / PI -> Factor = albedo
-        throughput *= payload.albedo;
+        // Throughput update: f_d * cos(theta) / PDF. With cosine sampling,
+        // PDF=NoL/PI cancels the Lambertian 1/PI. Apply Schlick Fresnel and
+        // metallic energy conservation to the remaining diffuse reflectance.
+        const float3 incomingDirection = safeNormalize(-ray.Direction, payload.normal);
+        const float3 bounceHalfVector = safeNormalize(incomingDirection + bounceDir, payload.normal);
+        const float3 bounceFresnel = fresnelSchlick(saturate(dot(bounceHalfVector, incomingDirection)), payload.specularF0);
+        const float3 diffuseEnergy = (1.0f - bounceFresnel) * (1.0f - payload.metallic);
+        throughput *= payload.albedo * diffuseEnergy;
 
         // Russian Roulette path termination after 1st bounce
         if (bounce > 0) {
@@ -693,6 +795,15 @@ void RayGenShader() {
 
     if (g_SceneCB.renderMode == 2 || g_SceneCB.renderMode == 3) {
         g_Output[launchIndex] = float4(totalRadiance, 1.0f);
+#if ENGINE_ENABLE_DLSS
+        g_DLSSInputColor[launchIndex] = float4(totalRadiance, 1.0f);
+        g_DLSSDepth[launchIndex] = 1.0f;
+        g_DLSSMotionVectors[launchIndex] = 0.0f;
+        g_DLSSNormalRoughness[launchIndex] = float4(0.0f, 0.0f, 1.0f, 1.0f);
+        g_DLSSDiffuseAlbedo[launchIndex] = 0.0f;
+        g_DLSSSpecularAlbedo[launchIndex] = 0.04f;
+        g_DLSSSpecularHitDistance[launchIndex] = 0.0f;
+#endif
         return;
     }
 
@@ -701,37 +812,127 @@ void RayGenShader() {
         isinf(totalRadiance.r) || isinf(totalRadiance.g) || isinf(totalRadiance.b)) {
         totalRadiance = float3(0.0f, 0.0f, 0.0f);
     }
-    totalRadiance = min(totalRadiance, float3(10.0f, 10.0f, 10.0f));
-    if (!all(isfinite(primaryNonDiffuseRadiance))) primaryNonDiffuseRadiance = 0.0f;
-    primaryNonDiffuseRadiance = clamp(primaryNonDiffuseRadiance, 0.0f, 10.0f);
+    // Keep HDR headroom for NRD's documented 0..250 radiance range. This is a
+    // last-resort finite firefly bound, not a secondary-bounce energy scale.
+    totalRadiance = min(totalRadiance, float3(250.0f, 250.0f, 250.0f));
+    if (!all(isfinite(primarySpecularRadiance))) primarySpecularRadiance = 0.0f;
+    if (!all(isfinite(primaryEmissiveRadiance))) primaryEmissiveRadiance = 0.0f;
+    if (!all(isfinite(primarySpecularF0))) primarySpecularF0 = 0.04f;
+    primarySpecularRadiance = clamp(primarySpecularRadiance, 0.0f, 250.0f);
+    primaryEmissiveRadiance = clamp(primaryEmissiveRadiance, 0.0f, 250.0f);
+    primarySpecularF0 = saturate(primarySpecularF0);
+    primarySpecularHitDistance = isfinite(primarySpecularHitDistance)
+        ? max(primarySpecularHitDistance, 0.0f) : 0.0f;
+
+#if ENGINE_ENABLE_DLSS
+    if (g_SceneCB.enableDLSS != 0) {
+        const float nearPlane = max(g_SceneCB.cameraClipPlanes.x, 1.0e-4f);
+        const float farPlane = max(g_SceneCB.cameraClipPlanes.y, nearPlane + 1.0e-3f);
+        const float viewZ = primaryHitT > 0.0f
+            ? max(dot(primaryHitPos - g_SceneCB.cameraPos, g_SceneCB.camForward), nearPlane)
+            : farPlane;
+        const float depthA = farPlane / (farPlane - nearPlane);
+        const float depthB = (nearPlane * farPlane) / (farPlane - nearPlane);
+        const float hardwareDepth = saturate(depthA - depthB / viewZ);
+
+        // DLSS consumes current-to-previous motion in render-pixel units. Project the
+        // same world-space sample through both unjittered camera bases; jitter is
+        // supplied separately to NGX so it is not double-counted in the vectors.
+        float2 motionPixels = 0.0f;
+        const float tanHalfFov = max(tan(g_SceneCB.fovY * 0.5f), 1.0e-5f);
+        float2 currentUv = float2(0.5f, 0.5f);
+        float2 previousUv = currentUv;
+        if (primaryHitT > 0.0f) {
+            const float3 currentDelta = primaryHitPos - g_SceneCB.cameraPos;
+            const float currentZ = max(dot(currentDelta, g_SceneCB.camForward), 1.0e-5f);
+            const float3 previousDelta = primaryHitPos - g_SceneCB.prevCameraPos;
+            const float previousZ = dot(previousDelta, g_SceneCB.prevCamForward);
+            currentUv = float2(0.5f + 0.5f * dot(currentDelta, g_SceneCB.camRight) /
+                                       (currentZ * tanHalfFov * max(g_SceneCB.aspectRatio, 1.0e-4f)),
+                               0.5f - 0.5f * dot(currentDelta, g_SceneCB.camUp) / (currentZ * tanHalfFov));
+            if (previousZ > 1.0e-5f) {
+                previousUv = float2(0.5f + 0.5f * dot(previousDelta, g_SceneCB.prevCamRight) /
+                                            (previousZ * tanHalfFov * max(g_SceneCB.aspectRatio, 1.0e-4f)),
+                                    0.5f - 0.5f * dot(previousDelta, g_SceneCB.prevCamUp) /
+                                            (previousZ * tanHalfFov));
+                motionPixels = (previousUv - currentUv) * float2(launchDim);
+            }
+        } else {
+            // Sky reprojection uses direction only because translation cannot move an
+            // infinitely distant environment point.
+            const float3 currentRay = safeNormalize(g_SceneCB.camForward +
+                g_SceneCB.camRight * ((pixelCenter.x / launchDim.x * 2.0f - 1.0f) * tanHalfFov * g_SceneCB.aspectRatio) +
+                g_SceneCB.camUp * ((1.0f - pixelCenter.y / launchDim.y * 2.0f) * tanHalfFov), rayDir);
+            const float currentX = dot(currentRay, g_SceneCB.camRight);
+            const float currentY = dot(currentRay, g_SceneCB.camUp);
+            const float currentZ = max(dot(currentRay, g_SceneCB.camForward), 1.0e-5f);
+            const float previousX = dot(currentRay, g_SceneCB.prevCamRight);
+            const float previousY = dot(currentRay, g_SceneCB.prevCamUp);
+            const float previousZ = dot(currentRay, g_SceneCB.prevCamForward);
+            if (previousZ > 1.0e-5f) {
+                currentUv = float2(0.5f + 0.5f * currentX / (currentZ * tanHalfFov * max(g_SceneCB.aspectRatio, 1.0e-4f)),
+                                   0.5f - 0.5f * currentY / (currentZ * tanHalfFov));
+                previousUv = float2(0.5f + 0.5f * previousX / (previousZ * tanHalfFov * max(g_SceneCB.aspectRatio, 1.0e-4f)),
+                                    0.5f - 0.5f * previousY / (previousZ * tanHalfFov));
+                motionPixels = (previousUv - currentUv) * float2(launchDim);
+            }
+        }
+        if (!all(isfinite(motionPixels)) || any(abs(motionPixels) > float2(launchDim))) motionPixels = 0.0f;
+
+        const float3 viewNormal = safeNormalize(float3(dot(primaryNormal, g_SceneCB.camRight),
+            dot(primaryNormal, g_SceneCB.camUp), dot(primaryNormal, g_SceneCB.camForward)), float3(0.0f, 0.0f, 1.0f));
+        const float3 diffuseAlbedo = saturate(primaryAlbedo) * (1.0f - saturate(primaryMetallic));
+        g_DLSSDepth[launchIndex] = hardwareDepth;
+        g_DLSSMotionVectors[launchIndex] = motionPixels;
+        g_DLSSNormalRoughness[launchIndex] = float4(viewNormal, saturate(primaryRoughness));
+        g_DLSSDiffuseAlbedo[launchIndex] = float4(diffuseAlbedo, 1.0f);
+        g_DLSSSpecularAlbedo[launchIndex] = float4(primarySpecularF0, 1.0f);
+        g_DLSSSpecularHitDistance[launchIndex] = primarySpecularHitDistance;
+    }
+#endif
 
 #if ENGINE_ENABLE_NRD
-    // NRD owns temporal history for this branch. Its diffuse signal contains
-    // direct diffuse plus diffuse-bounced lighting, demodulated by base color.
-    // Keep primary specular and emissive radiance outside REBLUR to preserve
-    // sharp highlights and emissive detail.
-    if (g_SceneCB.enableNRD != 0 && g_SceneCB.renderMode == 0) {
+    // NRD receives physically separated diffuse and specular signals. Material
+    // response is removed before denoising and restored in NrdComposite.hlsl.
+    // Primary emission stays outside the filters so emissive detail remains sharp.
+    if (g_SceneCB.enableNRD != 0 && g_SceneCB.renderMode <= 1u) {
         const float viewZ = primaryHitT > 0.0f
             ? max(dot(primaryHitPos - g_SceneCB.cameraPos, g_SceneCB.camForward), 0.001f)
             : NRD_INF;
-        const float3 materialFloor = max(primaryAlbedo, float3(0.02f, 0.02f, 0.02f));
-        // REBLUR's diffuse signal should include the primary diffuse direct
-        // term as well as later bounces; leaving direct light outside the
-        // denoiser preserves one-sample shadow grain across the entire image.
-        const float3 primaryDiffuseAndIndirect = max(totalRadiance - primaryNonDiffuseRadiance, 0.0f);
-        const float3 denoisedDiffuseRadiance = min(primaryDiffuseAndIndirect / materialFloor, 250.0f);
-        const float normalizedHitDistance = REBLUR_FrontEnd_GetNormHitDist(
-            firstIndirectHitDistance, viewZ, float3(3.0f, 0.1f, 20.0f), primaryRoughness);
-        g_NrdSignal[launchIndex] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
-            denoisedDiffuseRadiance, normalizedHitDistance, true);
+        float3 diffuseFactor;
+        float3 specularFactor;
+        NRD_MaterialFactors(primaryNormal, -rayDir, primaryAlbedo, primarySpecularF0,
+                            primaryRoughness, diffuseFactor, specularFactor);
+        const float3 primaryDiffuseAndIndirect = max(
+            totalRadiance - primarySpecularRadiance - primaryEmissiveRadiance, 0.0f);
+        const float3 denoisedDiffuseRadiance = min(primaryDiffuseAndIndirect / diffuseFactor, 250.0f);
+        const float3 denoisedSpecularRadiance = min(max(primarySpecularRadiance, 0.0f) / specularFactor, 250.0f);
+        const float diffuseHitDistance = max(firstIndirectHitDistance, 0.0f);
+        // If this frame traced a glossy reflection, use its first in-lobe hit;
+        // otherwise the indirect-path first hit is the recommended combined-light fallback.
+        // A missing in-lobe reflection ray has hit distance 0. Never substitute
+        // the diffuse path's unrelated first-bounce distance for specular data.
+        const float specularHitDistance = primarySpecularHitDistance;
+        const float normalizedDiffuseHitDistance = REBLUR_FrontEnd_GetNormHitDist(
+            diffuseHitDistance, viewZ, float3(3.0f, 0.1f, 20.0f), 1.0f);
+        const float normalizedSpecularHitDistance = REBLUR_FrontEnd_GetNormHitDist(
+            specularHitDistance, viewZ, float3(3.0f, 0.1f, 20.0f), primaryRoughness);
+        g_NrdDiffuseSignal[launchIndex] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
+            denoisedDiffuseRadiance, normalizedDiffuseHitDistance, true);
+        g_NrdSpecularSignal[launchIndex] = REBLUR_FrontEnd_PackRadianceAndNormHitDist(
+            denoisedSpecularRadiance, normalizedSpecularHitDistance, true);
         g_NrdNormalRoughness[launchIndex] = NRD_FrontEnd_PackNormalAndRoughness(
             primaryNormal, primaryRoughness, 0.0f);
         g_NrdViewZ[launchIndex] = viewZ;
         g_NrdMotion[launchIndex] = 0.0f;
-        g_NrdAlbedo[launchIndex] = float4(primaryAlbedo, 1.0f);
+        g_NrdDiffuseFactor[launchIndex] = float4(diffuseFactor, 1.0f);
+        g_NrdSpecularFactor[launchIndex] = float4(specularFactor, 1.0f);
         // Miss pixels are not denoised; preserve their sky radiance separately.
-        g_Accumulation[launchIndex] = float4(primaryHitT > 0.0f ? primaryNonDiffuseRadiance : primaryDirectRadiance, viewZ);
+        g_Accumulation[launchIndex] = float4(primaryHitT > 0.0f ? primaryEmissiveRadiance : primaryDirectRadiance, viewZ);
         g_Output[launchIndex] = float4(applyToneMapping(totalRadiance), 1.0f);
+#if ENGINE_ENABLE_DLSS
+        if (g_SceneCB.enableDLSS != 0) g_DLSSInputColor[launchIndex] = float4(totalRadiance, 1.0f);
+#endif
         return;
     }
 #endif
@@ -872,6 +1073,9 @@ void RayGenShader() {
         ? dot(primaryHitPos - g_SceneCB.cameraPos, g_SceneCB.camForward)
         : -1.0f;
     g_Accumulation[launchIndex] = float4(accumulatedRadiance, accumulatedDepth);
+#if ENGINE_ENABLE_DLSS
+    if (g_SceneCB.enableDLSS != 0) g_DLSSInputColor[launchIndex] = float4(accumulatedRadiance, 1.0f);
+#endif
 
     // Filter only the display radiance. The unfiltered estimator is retained in
     // g_Accumulation so spatial smoothing never compounds into temporal history.
@@ -893,9 +1097,14 @@ void AnyHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAttrib
     uint primIndex = PrimitiveIndex();
 
     InstanceData inst = g_Instances[instanceIndex];
+    // The outbound ray has already refracted through this object. Ignore only
+    // that source instance so it cannot immediately self-intersect on exit.
+    if (payload.transmissionState == 2u && payload.transmissionInstanceId == instanceIndex) {
+        IgnoreHit();
+    }
     MaterialData mat = g_Materials[inst.materialId];
 
-    if (mat.alphaCutoff > 0.0f && mat.textureId >= 0) {
+    if (mat.alphaCutoff > 0.0f && mat.textureId != -1) {
         uint i0 = g_Indices[inst.indexOffset + primIndex * 3 + 0] + inst.vertexOffset;
         uint i1 = g_Indices[inst.indexOffset + primIndex * 3 + 1] + inst.vertexOffset;
         uint i2 = g_Indices[inst.indexOffset + primIndex * 3 + 2] + inst.vertexOffset;
@@ -908,7 +1117,7 @@ void AnyHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAttrib
         float2 uv = v0.uv * barycentrics.x + v1.uv * barycentrics.y + v2.uv * barycentrics.z;
 
         const float textureLod = estimateTextureLod(v0, v1, v2, RayTCurrent());
-        float alpha = g_Textures.SampleLevel(g_LinearSampler, float3(uv, mat.textureId), textureLod).a;
+        float alpha = sampleMaterialTexture(mat.textureId, uv, textureLod).a;
         if (alpha < mat.alphaCutoff) {
             IgnoreHit();
         }
@@ -941,51 +1150,237 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
                                        float3(0.0f, 1.0f, 0.0f));
     float2 uv = v0.uv * barycentrics.x + v1.uv * barycentrics.y + v2.uv * barycentrics.z;
 
-    // Sample from Texture2DArray
+    // Sample from Texture2DArray. Material color/emission maps are sRGB-encoded;
+    // packed metal/roughness and tangent-space normals remain linear data.
+    const float materialLod = estimateTextureLod(v0, v1, v2, RayTCurrent());
     float4 texColor = float4(1.0f, 1.0f, 1.0f, 1.0f);
-    if (mat.textureId >= 0) {
-        const float textureLod = estimateTextureLod(v0, v1, v2, RayTCurrent());
-        texColor = g_Textures.SampleLevel(g_LinearSampler, float3(uv, mat.textureId), textureLod);
+    if (mat.textureId != -1) {
+        texColor = sampleMaterialTexture(mat.textureId, uv, materialLod);
     }
 
     // Transform normal to world space
-    float3 worldNormal = safeNormalize(mul((float3x3)ObjectToWorld4x3(), localNormal),
+    // A normal is a covector: for non-uniform scale, transform it by
+    // (object-to-world)^(-T), not by object-to-world. WorldToObject4x3 is
+    // the transposed inverse matrix, so matrix * column-vector gives A^(-T)n.
+    float3 worldNormal = safeNormalize(mul((float3x3)WorldToObject4x3(), localNormal),
                                        float3(0.0f, 1.0f, 0.0f));
+    float3 mappedWorldTangent = float3(1.0f, 0.0f, 0.0f);
+    float3 mappedTangentNormal = float3(0.0f, 0.0f, 1.0f);
+    float mappedTangentHandedness = 1.0f;
+    if (mat.normalTextureId != -1) {
+        const float3 edge1 = v1.position - v0.position;
+        const float3 edge2 = v2.position - v0.position;
+        const float2 uvEdge1 = v1.uv - v0.uv;
+        const float2 uvEdge2 = v2.uv - v0.uv;
+        const float uvDeterminant = uvEdge1.x * uvEdge2.y - uvEdge1.y * uvEdge2.x;
+        float3 localTangent;
+        float3 localBitangent;
+        if (isfinite(uvDeterminant) && abs(uvDeterminant) > 1.0e-10f) {
+            const float inverseUvDeterminant = rcp(uvDeterminant);
+            localTangent = (edge1 * uvEdge2.y - edge2 * uvEdge1.y) * inverseUvDeterminant;
+            localBitangent = (edge2 * uvEdge1.x - edge1 * uvEdge2.x) * inverseUvDeterminant;
+        } else {
+            const float3 tangentAxis = abs(localNormal.y) < 0.9f
+                ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
+            localTangent = cross(tangentAxis, localNormal);
+            localBitangent = cross(localNormal, localTangent);
+        }
+        localTangent = safeNormalize(localTangent - localNormal * dot(localNormal, localTangent),
+                                     float3(1.0f, 0.0f, 0.0f));
+        const float3 worldTangentUnnormalized = mul((float3x3)ObjectToWorld3x4(), localTangent);
+        const float3 worldBitangentUnnormalized = mul((float3x3)ObjectToWorld3x4(), localBitangent);
+        float3 worldTangent = worldTangentUnnormalized - worldNormal * dot(worldNormal, worldTangentUnnormalized);
+        worldTangent = safeNormalize(worldTangent,
+            safeNormalize(cross(abs(worldNormal.y) < 0.9f ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f),
+                                worldNormal), float3(1.0f, 0.0f, 0.0f)));
+        mappedTangentHandedness = dot(cross(worldNormal, worldTangent), worldBitangentUnnormalized) < 0.0f
+            ? -1.0f : 1.0f;
+        const float3 normalTexel = sampleMaterialTexture(mat.normalTextureId, uv, materialLod).rgb;
+        mappedTangentNormal = safeNormalize(normalTexel * 2.0f - 1.0f, float3(0.0f, 0.0f, 1.0f));
+        mappedWorldTangent = worldTangent;
+    }
     float3 hitPos = WorldRayOrigin() + WorldRayDirection() * RayTCurrent();
     float3 V = -WorldRayDirection();
 
     if (dot(worldNormal, V) < 0.0f) {
         worldNormal = -worldNormal;
     }
+    if (mat.normalTextureId != -1) {
+        const float3 worldBitangent = safeNormalize(cross(worldNormal, mappedWorldTangent) * mappedTangentHandedness,
+                                                     float3(0.0f, 0.0f, 1.0f));
+        worldNormal = safeNormalize(mappedWorldTangent * mappedTangentNormal.x +
+                                    worldBitangent * mappedTangentNormal.y +
+                                    worldNormal * mappedTangentNormal.z, worldNormal);
+    }
 
     // Material parameters
     float3 albedo = srgbToLinear(texColor.rgb) * mat.baseColor.rgb;
+    float metallic = (g_SceneCB.metallicOverride >= 0.0f) ? g_SceneCB.metallicOverride : mat.metallic;
+    float roughness = (g_SceneCB.roughnessOverride >= 0.0f) ? g_SceneCB.roughnessOverride : mat.roughness;
+    roughness = clamp(roughness, 0.08f, 0.98f);
+    metallic = clamp(metallic, 0.0f, 1.0f);
+    if (mat.metallicRoughnessTextureId != -1) {
+        const float3 packedMaterial = sampleMaterialTexture(
+            mat.metallicRoughnessTextureId, uv, materialLod).rgb;
+        roughness = clamp(roughness * packedMaterial.g, 0.04f, 0.98f);
+        metallic = saturate(metallic * packedMaterial.b);
+    }
+    const float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
+    const float3 viewFresnel = fresnelSchlick(saturate(dot(worldNormal, V)), F0);
+    const float3 ambientDiffuseWeight = (1.0f - viewFresnel) * (1.0f - metallic);
+
+    // The ray after a dielectric exit is deliberately bounded at this hit: the
+    // outer dielectric already accounts for transmission and absorption, so a
+    // compact textured PBR response avoids a fourth DXR recursion level.
+    if (payload.transmissionState == 2u) {
+        const float ambientMultiplier = g_SceneCB.ambientMultiplier > 0.0f
+            ? g_SceneCB.ambientMultiplier : 1.0f;
+        const float3 directL = safeNormalize(-g_SceneCB.sunDirection, float3(0.0f, 1.0f, 0.0f));
+        const float directNdotL = saturate(dot(worldNormal, directL));
+        const float3 direct = albedo * (1.0f - metallic) * g_SceneCB.sunColor.rgb *
+            (g_SceneCB.sunIntensity * directNdotL / PI);
+        float3 emission = max(mat.emissiveColor.rgb, 0.0f) * max(mat.emissive, 0.0f);
+        if (mat.emissiveTextureId != -1) {
+            emission *= srgbToLinear(sampleMaterialTexture(mat.emissiveTextureId, uv, materialLod).rgb);
+        }
+        const float3 ambient = sampleSceneDiffuseEnvironment(worldNormal) * ambientMultiplier;
+        payload.color = albedo * ambientDiffuseWeight * ambient + direct + emission;
+        payload.albedo = albedo;
+        payload.normal = worldNormal;
+        payload.hitPos = hitPos;
+        payload.hitT = RayTCurrent();
+        payload.specularRadiance = 0.0f;
+        payload.emissiveRadiance = emission;
+        payload.specularF0 = F0;
+        payload.specularHitDistance = 0.0f;
+        payload.roughness = roughness;
+        payload.metallic = metallic;
+        return;
+    }
+
+    const float dielectricTransmission = saturate(mat.dielectric.x);
+    if (dielectricTransmission > 0.0f && payload.transmissionState == 0u &&
+        payload.transmissionInstanceId == 0xffffffffu &&
+        (payload.sampleStream & 0x80000000u) == 0u) {
+        const float ior = clamp(isfinite(mat.dielectric.y) ? mat.dielectric.y : 1.0f, 1.0f, 2.5f);
+        const float eta = 1.0f / ior;
+        const float3 incident = safeNormalize(-V, -worldNormal);
+        const float3 transmittedDirection = refract(incident, worldNormal, eta);
+        const float cosineView = saturate(dot(worldNormal, V));
+        const float iorRatio = (ior - 1.0f) / max(ior + 1.0f, 1.0e-4f);
+        const float dielectricF0 = iorRatio * iorRatio;
+        const float fresnel = dielectricF0 + (1.0f - dielectricF0) * pow(1.0f - cosineView, 5.0f);
+
+        float3 reflectedRadiance = sampleSceneEnvironment(reflect(incident, worldNormal), roughness, false);
+        RayDesc reflectionRay;
+        reflectionRay.Origin = hitPos + worldNormal * 0.004f;
+        reflectionRay.Direction = safeNormalize(reflect(incident, worldNormal), worldNormal);
+        reflectionRay.TMin = 0.001f;
+        reflectionRay.TMax = 10000.0f;
+        RayPayload reflectionPayload;
+        reflectionPayload.color = 0.0f;
+        reflectionPayload.albedo = 0.0f;
+        reflectionPayload.normal = 0.0f;
+        reflectionPayload.hitPos = 0.0f;
+        reflectionPayload.specularRadiance = 0.0f;
+        reflectionPayload.emissiveRadiance = 0.0f;
+        reflectionPayload.specularF0 = dielectricF0.xxx;
+        reflectionPayload.hitT = -1.0f;
+        reflectionPayload.roughness = roughness;
+        reflectionPayload.specularHitDistance = 0.0f;
+        reflectionPayload.metallic = 0.0f;
+        reflectionPayload.sampleSeed = payload.sampleSeed;
+        reflectionPayload.sampleStream = (payload.sampleStream & ~0x40000000u) | 0x80000000u;
+        reflectionPayload.reflectionPixelParity = payload.reflectionPixelParity;
+        reflectionPayload.transmissionState = 0u;
+        reflectionPayload.transmissionInstanceId = 0xffffffffu;
+        TraceRay(g_Scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, reflectionRay, reflectionPayload);
+        reflectedRadiance = max(reflectionPayload.color, 0.0f);
+
+        float3 transmittedRadiance = sampleSceneEnvironment(transmittedDirection, roughness, false);
+        if (all(isfinite(transmittedDirection)) && dot(transmittedDirection, transmittedDirection) > 1.0e-8f) {
+            RayDesc transmissionRay;
+            transmissionRay.Origin = hitPos + transmittedDirection * 0.004f;
+            transmissionRay.Direction = transmittedDirection;
+            transmissionRay.TMin = 0.001f;
+            transmissionRay.TMax = 10000.0f;
+            RayPayload transmissionPayload;
+            transmissionPayload.color = 0.0f;
+            transmissionPayload.albedo = 0.0f;
+            transmissionPayload.normal = 0.0f;
+            transmissionPayload.hitPos = 0.0f;
+            transmissionPayload.specularRadiance = 0.0f;
+            transmissionPayload.emissiveRadiance = 0.0f;
+            transmissionPayload.specularF0 = dielectricF0.xxx;
+            transmissionPayload.hitT = -1.0f;
+            transmissionPayload.roughness = roughness;
+            transmissionPayload.specularHitDistance = 0.0f;
+            transmissionPayload.metallic = 0.0f;
+            transmissionPayload.sampleSeed = payload.sampleSeed;
+            transmissionPayload.sampleStream = payload.sampleStream & 0x3fffffffu;
+            transmissionPayload.reflectionPixelParity = payload.reflectionPixelParity;
+            transmissionPayload.transmissionState = 2u;
+            transmissionPayload.transmissionInstanceId = instanceIndex;
+            TraceRay(g_Scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, transmissionRay, transmissionPayload);
+            transmittedRadiance = max(transmissionPayload.color, 0.0f);
+        }
+
+        const float3 surfaceEmission = max(mat.emissiveColor.rgb, 0.0f) * max(mat.emissive, 0.0f);
+        const float3 attenuation = exp(-min(max(mat.volumeAbsorption.rgb, 0.0f) *
+            max(mat.dielectric.z, 0.0f), 80.0f));
+        payload.color = reflectedRadiance * fresnel + transmittedRadiance *
+            (attenuation * dielectricTransmission * (1.0f - fresnel)) + surfaceEmission;
+        payload.albedo = albedo;
+        payload.normal = worldNormal;
+        payload.hitPos = hitPos;
+        payload.hitT = RayTCurrent();
+        payload.specularRadiance = reflectedRadiance * fresnel;
+        payload.emissiveRadiance = surfaceEmission;
+        payload.specularF0 = dielectricF0.xxx;
+        payload.specularHitDistance = 0.0f;
+        payload.roughness = roughness;
+        payload.metallic = 1.0f;
+        payload.transmissionState = 3u;
+        return;
+    }
 
     // Reflected hits use a lightweight environment-lit material response. This
     // keeps all specular reflections to two DXR levels and avoids recursively
     // spawning reflection or shadow rays from the reflected hit.
     if ((payload.sampleStream & 0x80000000u) != 0u) {
         const float reflectedNdotL = saturate(dot(worldNormal, safeNormalize(-g_SceneCB.sunDirection, float3(0.0f, 1.0f, 0.0f))));
-        const float reflectedAmbient = g_SceneCB.padPrev3 > 0.0f ? g_SceneCB.padPrev3 : 1.0f;
+        const float reflectedAmbient = g_SceneCB.ambientMultiplier > 0.0f ? g_SceneCB.ambientMultiplier : 1.0f;
         const float skyHemi = saturate(0.5f + 0.5f * worldNormal.y);
-        const float3 reflectedSky = lerp(g_SceneCB.skyHorizonColor.rgb * 0.55f,
-            g_SceneCB.skyZenithColor.rgb, skyHemi) * (0.18f * skyHemi + 0.025f) * reflectedAmbient;
+        const float3 reflectedSky = g_SceneCB.environmentMapEnabled != 0u
+            ? sampleSceneDiffuseEnvironment(worldNormal) * reflectedAmbient
+            : lerp(g_SceneCB.skyHorizonColor.rgb * 0.55f,
+                g_SceneCB.skyZenithColor.rgb, skyHemi) * (0.18f * skyHemi + 0.025f) * reflectedAmbient;
         const float3 reflectedSun = g_SceneCB.sunColor.rgb * g_SceneCB.sunIntensity
             * (reflectedNdotL / PI);
-        payload.color = albedo * (reflectedSky + reflectedSun) + albedo * mat.emissive;
+        float3 emission = max(mat.emissiveColor.rgb, 0.0f) * max(mat.emissive, 0.0f);
+        if (mat.emissiveTextureId != -1) {
+            const float3 emissiveTexel = sampleMaterialTexture(mat.emissiveTextureId, uv, materialLod).rgb;
+            emission *= srgbToLinear(emissiveTexel);
+        }
+        payload.color = albedo * ambientDiffuseWeight *
+            (reflectedSky + reflectedSun) + emission;
         payload.albedo = albedo;
         payload.normal = worldNormal;
         payload.hitPos = hitPos;
-        payload.nonDiffuseRadiance = 0.0f;
+        payload.specularRadiance = 0.0f;
+        payload.emissiveRadiance = 0.0f;
+        payload.specularF0 = F0;
+        payload.specularHitDistance = 0.0f;
         payload.hitT = RayTCurrent();
-        payload.roughness = mat.roughness;
+        payload.roughness = roughness;
+        payload.metallic = metallic;
         return;
     }
 
     // The water branch is isolated by a material flag. Existing Sponza assets
     // keep the flag at zero and continue through the original PBR/GI path.
-    if (mat.pad.x > 0.5f) {
-        const float t = g_SceneCB.padPrev1;
+    if (mat.emissiveColor.w > 0.5f) {
+        const float t = g_SceneCB.oceanTime;
         float waterRayT = RayTCurrent();
         float x = hitPos.x;
         float z = hitPos.z;
@@ -1195,15 +1590,27 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
                 reflectionPayload.albedo = 0.0f;
                 reflectionPayload.normal = 0.0f;
                 reflectionPayload.hitPos = 0.0f;
-                reflectionPayload.nonDiffuseRadiance = 0.0f;
+                reflectionPayload.specularRadiance = 0.0f;
+                reflectionPayload.emissiveRadiance = 0.0f;
+                reflectionPayload.specularF0 = 0.04f;
                 reflectionPayload.hitT = -1.0f;
                 reflectionPayload.sampleSeed = payload.sampleSeed;
-                reflectionPayload.sampleStream = payload.sampleStream | 0x80000000u;
+                reflectionPayload.sampleStream = (payload.sampleStream & ~0x40000000u) | 0x80000000u;
+                reflectionPayload.reflectionPixelParity = payload.reflectionPixelParity;
+                reflectionPayload.specularHitDistance = 0.0f;
+                reflectionPayload.roughness = 1.0f;
+                reflectionPayload.metallic = 0.0f;
+                reflectionPayload.transmissionState = 0u;
+                reflectionPayload.transmissionInstanceId = 0xffffffffu;
                 TraceRay(g_Scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, reflectionRay, reflectionPayload);
                 reflectionColor = reflectionPayload.color;
             }
             const float nDotV = saturate(dot(worldNormal, V));
-            const float fresnel = 0.02f + 0.98f * pow(1.0f - nDotV, 5.0f);
+            const float dielectricFresnel = 0.02f + 0.98f * pow(1.0f - nDotV, 5.0f);
+            // An art-direction control boosts the reflected share for this demo. The
+            // saturated blend remains in [0,1], so reflected and absorbed energy
+            // still partition the water response instead of being added twice.
+            const float reflectionBlend = saturate(dielectricFresnel * max(g_SceneCB.waterReflectionStrength, 1.0f));
             const float3 sunDirection = safeNormalize(-g_SceneCB.sunDirection, float3(0.0f, 1.0f, 0.0f));
             const float sunNdotL = saturate(dot(worldNormal, sunDirection));
             const float3 deepWater = albedo * (0.32f + 0.48f * sunNdotL);
@@ -1223,7 +1630,7 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
             const float foamCrest = saturate((waveHeight - 0.35f) * 1.5f + (slopeLength - 0.80f) * 0.28f);
             const float foam = saturate((foamCrest - 0.82f) * 6.0f) * smoothstep(0.58f, 0.86f, foamNoise);
             const float3 foamColor = float3(0.56f, 0.70f, 0.74f);
-            payload.color = lerp(deepWater, max(reflectionColor, 0.0f), fresnel)
+            payload.color = lerp(deepWater, max(reflectionColor, 0.0f), reflectionBlend)
                 + waterSpecular
                 + foamColor * max(foam * 0.22f, impactFoam * 0.62f);
         }
@@ -1232,40 +1639,28 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
         payload.hitPos = hitPos;
         payload.hitT = waterRayT;
         payload.roughness = mat.roughness;
+        payload.metallic = 0.0f;
         return;
     }
 
-    float metallic = (g_SceneCB.metallicOverride >= 0.0f) ? g_SceneCB.metallicOverride : mat.metallic;
-    float roughness = (g_SceneCB.roughnessOverride >= 0.0f) ? g_SceneCB.roughnessOverride : mat.roughness;
-    roughness = clamp(roughness, 0.08f, 0.98f);
-    metallic = clamp(metallic, 0.0f, 1.0f);
-
-    float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-
-    if (mat.metallicRoughnessTextureId >= 0) {
-        const float materialLod = estimateTextureLod(v0, v1, v2, RayTCurrent());
-        const float2 metallicRoughness = g_Textures.SampleLevel(
-            g_LinearSampler, float3(uv, mat.metallicRoughnessTextureId), materialLod).gb;
-        roughness = clamp(roughness * metallicRoughness.x, 0.04f, 0.98f);
-        metallic = saturate(metallic * metallicRoughness.y);
-        F0 = lerp(float3(0.04f, 0.04f, 0.04f), albedo, metallic);
-    }
-
-    const float3 viewFresnel = fresnelSchlick(saturate(dot(worldNormal, V)), F0);
     const float maxViewFresnel = max(viewFresnel.r, max(viewFresnel.g, viewFresnel.b));
     const uint reflectionSampleIndex = payload.sampleStream & 0x00ffffffu;
-    // Use randomized systematic half-rate sampling: the per-pixel hash chooses
-    // which sample-index parity is traced, so each consecutive pair contributes
-    // one reflection ray. Weighting by 1/p (p=0.5) preserves the estimator mean
-    // across the complementary Owen-scrambled Sobol subsequences.
-    const bool traceReflectionThisSample = ((payload.sampleSeed ^ reflectionSampleIndex) & 1u) == 0u;
+    // A 2x2 spatial checkerboard alternates phase with the progressive sample
+    // index: each pixel traces one GGX ray per pair of samples, and each 3x3
+    // neighborhood has valid samples for REBLUR's AREA_3X3 reconstruction.
+    // The factor 2 below compensates for the half-rate sampling probability;
+    // the Sobol dimensions for the ray itself are independently Owen-scrambled.
+    const bool traceReflectionThisSample =
+        ((payload.reflectionPixelParity ^ reflectionSampleIndex) & 1u) == 0u;
     const bool reflectionIsSignificant =
         (metallic > 0.15f && roughness < 0.70f) ||
         // Polished dielectrics have only ~4% normal-incidence F0. Do not
         // suppress their physically valid reflection ray at normal view angles.
         (roughness < 0.42f && maxViewFresnel > 0.0f);
     float3 tracedReflection = 0.0f;
+    float tracedReflectionHitDistance = 0.0f;
     if (g_SceneCB.renderMode <= 1u && (payload.sampleStream & 0x40000000u) != 0u &&
+        (payload.sampleStream & 0x80000000u) == 0u &&
         g_SceneCB.enableRayTracedReflections > 0.5f &&
         traceReflectionThisSample &&
         reflectionIsSignificant) {
@@ -1299,16 +1694,24 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
             reflectionPayload.albedo = 0.0f;
             reflectionPayload.normal = 0.0f;
             reflectionPayload.hitPos = 0.0f;
-            reflectionPayload.nonDiffuseRadiance = 0.0f;
+            reflectionPayload.specularRadiance = 0.0f;
+            reflectionPayload.emissiveRadiance = 0.0f;
+            reflectionPayload.specularF0 = 0.04f;
             reflectionPayload.hitT = -1.0f;
-            reflectionPayload.roughness = 1.0f;
+            reflectionPayload.roughness = roughness;
             reflectionPayload.sampleSeed = payload.sampleSeed;
-            reflectionPayload.sampleStream = reflectionSampleStream | 0x80000000u;
+            reflectionPayload.sampleStream = (reflectionSampleStream & ~0x40000000u) | 0x80000000u;
+            reflectionPayload.reflectionPixelParity = payload.reflectionPixelParity;
+            reflectionPayload.specularHitDistance = 0.0f;
+            reflectionPayload.metallic = 0.0f;
+            reflectionPayload.transmissionState = 0u;
+            reflectionPayload.transmissionInstanceId = 0xffffffffu;
             TraceRay(g_Scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, reflectionRay, reflectionPayload);
 
             const float3 fresnel = fresnelSchlick(vDotHReflect, F0);
             const float brdfOverPdf = smithGGXG1(nDotLReflect, alpha);
             tracedReflection = max(reflectionPayload.color, 0.0f) * fresnel * brdfOverPdf * 2.0f;
+            tracedReflectionHitDistance = max(reflectionPayload.hitT, 0.0f);
         }
     }
 
@@ -1337,8 +1740,13 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
         shadowRay.TMin = 0.001f;
         shadowRay.TMax = 1000.0f;
 
-        ShadowPayload shadowPayload;
+        // AnyHitShader is also used by the shadow ray's hit group and reads the
+        // transmission fields. Initialize those fields even though a shadow
+        // ray only consumes visibility from the payload.
+        RayPayload shadowPayload;
         shadowPayload.visibility = 0.0f;
+        shadowPayload.transmissionState = 0u;
+        shadowPayload.transmissionInstanceId = 0xffffffffu;
 
         TraceRay(
             g_Scene,
@@ -1365,21 +1773,31 @@ void ClosestHitShader(inout RayPayload payload, in BuiltInTriangleIntersectionAt
     float3 diffuse = kD * (albedo / PI);
 
     float3 directRadiance = (diffuse + specular) * g_SceneCB.sunColor.rgb * g_SceneCB.sunIntensity * NdotL * shadowVisibility;
-
     // Emissive
-    float3 emissive = albedo * mat.emissive;
-    payload.nonDiffuseRadiance = specular * g_SceneCB.sunColor.rgb * g_SceneCB.sunIntensity * NdotL * shadowVisibility
-                               + emissive + tracedReflection;
+    float3 emissive = max(mat.emissiveColor.rgb, 0.0f) * max(mat.emissive, 0.0f);
+    if (mat.emissiveTextureId != -1) {
+        const float3 emissiveTexel = sampleMaterialTexture(mat.emissiveTextureId, uv, materialLod).rgb;
+        emissive *= srgbToLinear(emissiveTexel);
+    }
+    payload.specularRadiance = specular * g_SceneCB.sunColor.rgb * g_SceneCB.sunIntensity * NdotL * shadowVisibility
+                             + tracedReflection;
+    payload.emissiveRadiance = emissive;
+    payload.specularF0 = F0;
+    payload.specularHitDistance = tracedReflectionHitDistance;
+    payload.metallic = metallic;
 
     // Physical surface radiance: Direct sun light + emissive
     // Physical Sky Irradiance Base: In open-roof architectural models like Sponza,
     // diffuse hemispherical skylight illuminates all surfaces visible to the open sky.
-    float skyHemi = saturate(0.5f + 0.5f * worldNormal.y);
-    float3 skyLight = lerp(g_SceneCB.skyHorizonColor.rgb * 0.55f, g_SceneCB.skyZenithColor.rgb, skyHemi) * skyHemi * 0.32f;
-    float3 ambientRecess = g_SceneCB.skyZenithColor.rgb * 0.04f;
-    float ambientMultiplier = g_SceneCB.padPrev3 > 0.0f ? g_SceneCB.padPrev3 : 1.0f;
-    float3 ambientBase = (skyLight + ambientRecess) * albedo * ambientMultiplier;
-
+    float ambientMultiplier = g_SceneCB.ambientMultiplier > 0.0f ? g_SceneCB.ambientMultiplier : 1.0f;
+    // In path-tracing mode with diffuse bounces enabled, environment lighting
+    // is gathered by the next cosine-sampled path segment. Adding the full
+    // convolved IBL term here as well would count it twice. Keep the stable IBL
+    // fallback for direct mode and zero-bounce preview mode.
+    const bool evaluateEnvironmentHere = g_SceneCB.renderMode != 0u || g_SceneCB.maxBounces == 0u;
+    float3 ambientBase = evaluateEnvironmentHere
+        ? sampleSceneDiffuseEnvironment(worldNormal) * albedo * ambientDiffuseWeight * ambientMultiplier
+        : float3(0.0f, 0.0f, 0.0f);
     if (g_SceneCB.renderMode == 1) {
         // Direct + RT Shadows only (single bounce mode with sky ambient fill)
         payload.color = directRadiance + emissive + ambientBase + tracedReflection;
@@ -1412,7 +1830,10 @@ void MissShader(inout RayPayload payload) {
     // the analytic solar disk on reflected misses avoids counting that source
     // twice; primary camera misses still show the disk and its soft glow.
     const bool reflectedRay = (payload.sampleStream & 0x80000000u) != 0u;
-    payload.color = evaluateSky(WorldRayDirection(), !reflectedRay);
+    const bool primaryRay = (payload.sampleStream & 0x40000000u) != 0u;
+    const float environmentRoughness = reflectedRay ? payload.roughness : (primaryRay ? 0.0f : 1.0f);
+    payload.color = sampleSceneEnvironment(WorldRayDirection(), environmentRoughness,
+        primaryRay && !reflectedRay);
     payload.hitT = -1.0f;
 }
 
@@ -1420,6 +1841,6 @@ void MissShader(inout RayPayload payload) {
 // Shadow Miss Shader (Unoccluded = 1.0)
 // -------------------------------------------------------------
 [shader("miss")]
-void ShadowMissShader(inout ShadowPayload payload) {
+void ShadowMissShader(inout RayPayload payload) {
     payload.visibility = 1.0f;
 }

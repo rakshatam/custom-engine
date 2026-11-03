@@ -42,6 +42,7 @@ private:
 
     ComPtr<ID3D12Resource>      m_uiReadbackBuffer;
     uint32_t                    m_uiReadbackPitch = 0;
+    bool                        m_uiReadbackValid = false;
 };
 
 } // namespace Engine

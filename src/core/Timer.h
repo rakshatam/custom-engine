@@ -1,39 +1,36 @@
 #pragma once
-#include <windows.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 
 namespace Engine {
 
 class Timer {
 public:
-    Timer() {
-        QueryPerformanceFrequency(&m_frequency);
-        QueryPerformanceCounter(&m_startTime);
-        m_prevTime = m_startTime;
-    }
+    using Clock = std::chrono::steady_clock;
+
+    Timer() { reset(); }
 
     void reset() {
-        QueryPerformanceCounter(&m_startTime);
+        m_startTime = Clock::now();
         m_prevTime = m_startTime;
     }
 
     float tick() {
-        LARGE_INTEGER currentTime;
-        QueryPerformanceCounter(&currentTime);
-        float dt = static_cast<float>(currentTime.QuadPart - m_prevTime.QuadPart) / static_cast<float>(m_frequency.QuadPart);
+        const Clock::time_point currentTime = Clock::now();
+        const float dt = std::chrono::duration<float>(currentTime - m_prevTime).count();
         m_prevTime = currentTime;
-        return dt;
+        return std::isfinite(dt) ? std::max(dt, 0.0f) : 0.0f;
     }
 
     float totalTime() const {
-        LARGE_INTEGER currentTime;
-        QueryPerformanceCounter(&currentTime);
-        return static_cast<float>(currentTime.QuadPart - m_startTime.QuadPart) / static_cast<float>(m_frequency.QuadPart);
+        const float elapsed = std::chrono::duration<float>(Clock::now() - m_startTime).count();
+        return std::isfinite(elapsed) ? std::max(elapsed, 0.0f) : 0.0f;
     }
 
 private:
-    LARGE_INTEGER m_frequency;
-    LARGE_INTEGER m_startTime;
-    LARGE_INTEGER m_prevTime;
+    Clock::time_point m_startTime{};
+    Clock::time_point m_prevTime{};
 };
 
 } // namespace Engine

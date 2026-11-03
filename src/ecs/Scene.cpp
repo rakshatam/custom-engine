@@ -12,6 +12,7 @@
 #include "../core/Window.h"
 #include <iostream>
 #include <cmath>
+#include <cctype>
 #include <cstring>
 #include <algorithm>
 #include <utility>
@@ -80,8 +81,28 @@ SceneEntity* Scene::getEntity(EntityID id) {
         ? &m_entities[*index] : nullptr;
 }
 
-void Scene::setSelectedEntityId(EntityID id) {
+const SceneEntity* Scene::getEntity(EntityID id) const {
+    const auto index = m_entityIndex.find(id);
+    return index && *index < m_entities.size() && m_entities[*index].id == id
+        ? &m_entities[*index] : nullptr;
+}
+
+Vec3 Scene::getSelectedEntityLocalAnchor() const {
+    const SceneEntity* selected = getEntity(m_selectedEntityId);
+    if (!selected) return Vec3(0.0f);
+    if (m_hasSelectedLocalAnchor) return m_selectedLocalAnchor;
+    return selected->mesh.localAABB.min * 0.5f + selected->mesh.localAABB.max * 0.5f;
+}
+
+void Scene::setSelectedEntityId(EntityID id, const Vec3* localAnchor) {
     m_selectedEntityId = (id == NULL_ENTITY || getEntity(id)) ? id : NULL_ENTITY;
+    m_hasSelectedLocalAnchor = false;
+    if (m_selectedEntityId == NULL_ENTITY || !localAnchor ||
+        !std::isfinite(localAnchor->x) || !std::isfinite(localAnchor->y) || !std::isfinite(localAnchor->z)) {
+        return;
+    }
+    m_selectedLocalAnchor = *localAnchor;
+    m_hasSelectedLocalAnchor = true;
 }
 
 bool Scene::rebuildEntityIndex() {
@@ -137,6 +158,10 @@ bool Scene::updateEntityMaterial(EntityID id) {
 }
 
 bool Scene::init(D3D12Device& device, const std::string& gltfPath) {
+    m_isOceanScene = false;
+    m_isReflectionLabScene = false;
+    m_textureArrayLayerCount = 0;
+    m_textureArrayResolution = 1024;
     m_camera.position = Vec3(5.3f, 2.4f, -0.4f);
     m_camera.yaw = 180.0f;
     m_camera.pitch = -1.0f;
@@ -159,11 +184,12 @@ bool Scene::init(D3D12Device& device, const std::string& gltfPath) {
     m_sceneCbData.shadowSoftness = 0.35f;
     m_sceneCbData.enableShadows = 1;
     m_sceneCbData.enableRayTracedReflections = 1.0f;
+    m_sceneCbData.waterReflectionStrength = 1.0f;
 
     m_sceneCbData.enableTAA = 1; // Depth-aware temporal antialiasing enabled.
     m_sceneCbData.taaBlendWeight = 0.10f;
     m_sceneCbData.enableNRD = 1;
-    m_sceneCbData.padPrev3 = 0.0f; // Ocean-only sky and ambient mode stays off for Sponza.
+    m_sceneCbData.ambientMultiplier = 0.0f; // Ocean-only sky and ambient mode stays off for Sponza.
 
     m_sceneCbData.sunDirection = XMFLOAT3(m_sun.direction.x, m_sun.direction.y, m_sun.direction.z);
     m_sceneCbData.sunIntensity = m_sun.intensity;
@@ -256,15 +282,32 @@ bool Scene::uploadGpuScene(D3D12Device& device) {
         const MaterialData& material = m_allMaterials[i];
         const float values[] = { material.baseColor.x, material.baseColor.y, material.baseColor.z,
             material.baseColor.w, material.metallic, material.roughness, material.emissive,
-            material.alphaCutoff };
+            material.alphaCutoff, material.emissiveColor.x, material.emissiveColor.y,
+            material.emissiveColor.z, material.emissiveColor.w, material.dielectric.x,
+            material.dielectric.y, material.dielectric.z, material.dielectric.w,
+            material.volumeAbsorption.x, material.volumeAbsorption.y,
+            material.volumeAbsorption.z, material.volumeAbsorption.w };
         for (float value : values) {
             if (!std::isfinite(value)) {
                 std::cerr << "[Scene Error] Non-finite GPU material value at material " << i << ".\n";
                 return false;
             }
         }
-        if (material.textureId < -1 || material.metallicRoughnessTextureId < -1) {
-            std::cerr << "[Scene Error] Invalid negative texture layer at material " << i << ".\n";
+        const auto validTextureId = [this](int textureId) {
+            if (textureId == -1) return true;
+            return textureId >= 0 && static_cast<uint32_t>(textureId) < m_textureArrayLayerCount;
+        };
+        if (!validTextureId(material.textureId) || !validTextureId(material.metallicRoughnessTextureId) ||
+            !validTextureId(material.normalTextureId) || !validTextureId(material.emissiveTextureId)) {
+            std::cerr << "[Scene Error] Invalid texture layer at material " << i << ".\n";
+            return false;
+        }
+        if (material.dielectric.x < 0.0f || material.dielectric.x > 1.0f ||
+            material.dielectric.y < 1.0f || material.dielectric.y > 2.5f ||
+            material.dielectric.z < 0.0f ||
+            material.volumeAbsorption.x < 0.0f || material.volumeAbsorption.y < 0.0f ||
+            material.volumeAbsorption.z < 0.0f) {
+            std::cerr << "[Scene Error] Invalid dielectric or absorption data at material " << i << ".\n";
             return false;
         }
     }
@@ -319,24 +362,26 @@ bool Scene::uploadGpuScene(D3D12Device& device) {
         }
     }
 
-    device.beginFrame();
+    if (!device.beginFrame()) return false;
+    const auto finishGpuUpload = [&device]() {
+        return device.endFrame() && device.waitForGpu();
+    };
     m_blases.resize(m_entities.size());
     for (size_t i = 0; i < m_entities.size(); ++i) {
         auto& ent = m_entities[i];
         if (i >= m_allInstances.size() || ent.mesh.indexCount == 0 || ent.mesh.indexCount % 3 != 0) {
             std::cerr << "[Scene Error] Entity '" << ent.name.name << "' has no valid triangle instance data.\n";
-            device.endFrame();
-            device.waitForGpu();
+            finishGpuUpload();
             return false;
         }
         const bool isOpaque = i >= m_allInstances.size() || m_allInstances[i].materialId >= m_allMaterials.size()
-            || m_allMaterials[m_allInstances[i].materialId].alphaCutoff <= 0.0f;
+            || (m_allMaterials[m_allInstances[i].materialId].alphaCutoff <= 0.0f &&
+                m_allMaterials[m_allInstances[i].materialId].dielectric.x <= 0.0f);
         if (!m_blases[i].build(device, m_vertexBuffer.Get(), static_cast<uint64_t>(ent.mesh.vertexOffset) * sizeof(Vertex),
             ent.mesh.vertexCount, sizeof(Vertex), m_indexBuffer.Get(),
             static_cast<uint64_t>(ent.mesh.indexOffset) * sizeof(uint32_t), ent.mesh.indexCount, isOpaque)) {
             std::cerr << "[Scene Error] BLAS build validation/allocation failed for entity '" << ent.name.name << "'.\n";
-            device.endFrame();
-            device.waitForGpu();
+            finishGpuUpload();
             return false;
         }
         ent.mesh.blasIndex = static_cast<uint32_t>(i);
@@ -349,8 +394,7 @@ bool Scene::uploadGpuScene(D3D12Device& device) {
         inst.blasGpuAddress = m_blases[i].getGpuAddress();
         if (inst.blasGpuAddress == 0) {
             std::cerr << "[Scene Error] BLAS GPU address is null for entity '" << m_entities[i].name.name << "'.\n";
-            device.endFrame();
-            device.waitForGpu();
+            finishGpuUpload();
             return false;
         }
         m_entities[i].transform.get3x4RowMajor(inst.transform);
@@ -360,17 +404,21 @@ bool Scene::uploadGpuScene(D3D12Device& device) {
     }
     if (!m_tlas.build(device, tlasInstances)) {
         std::cerr << "[Scene Error] TLAS build validation/allocation failed for " << tlasInstances.size() << " instances.\n";
-        device.endFrame();
-        device.waitForGpu();
+        finishGpuUpload();
         return false;
     }
-    device.endFrame();
-    device.waitForGpu();
+    if (!finishGpuUpload()) {
+        std::cerr << "[Scene Error] GPU acceleration-structure upload did not complete successfully.\n";
+        return false;
+    }
     return true;
 }
 
 bool Scene::initOcean(D3D12Device& device) {
     m_isOceanScene = true;
+    m_isReflectionLabScene = false;
+    m_textureArrayLayerCount = 0;
+    m_textureArrayResolution = 1024;
     m_oceanImpactCount = 0;
     m_oceanEntryCrossingCount = 0;
     m_oceanExitCrossingCount = 0;
@@ -400,12 +448,13 @@ bool Scene::initOcean(D3D12Device& device) {
     m_sceneCbData.taaBlendWeight = 0.22f;
     m_sceneCbData.enableNRD = 0; // The moving ocean keeps its dedicated non-temporal renderer path.
     m_sceneCbData.enableRayTracedReflections = 1.0f;
+    m_sceneCbData.waterReflectionStrength = 2.5f;
     m_sceneCbData.sunDirection = XMFLOAT3(m_sun.direction.x, m_sun.direction.y, m_sun.direction.z);
     m_sceneCbData.sunIntensity = m_sun.intensity;
     m_sceneCbData.sunColor = XMFLOAT4(m_sun.color.x, m_sun.color.y, m_sun.color.z, 1.0f);
     m_sceneCbData.skyZenithColor = XMFLOAT4(0.19f, 0.31f, 0.40f, 1.0f);
     m_sceneCbData.skyHorizonColor = XMFLOAT4(0.48f, 0.58f, 0.63f, 1.0f);
-    m_sceneCbData.padPrev3 = 5.0f; // Brighter open-water fill keeps unlit prop sides readable.
+    m_sceneCbData.ambientMultiplier = 5.0f; // Brighter open-water fill keeps unlit prop sides readable.
 
     MaterialData water = {};
     water.baseColor = XMFLOAT4(0.008f, 0.045f, 0.072f, 1.0f);
@@ -414,7 +463,7 @@ bool Scene::initOcean(D3D12Device& device) {
     water.textureId = -1;
     water.metallicRoughnessTextureId = -1;
     water.alphaCutoff = 0.0f;
-    water.pad[0] = 1.0f; // Water shader branch; unused for every existing Sponza material.
+    water.emissiveColor = XMFLOAT4(water.baseColor.x, water.baseColor.y, water.baseColor.z, 1.0f);
     m_allMaterials.push_back(water);
 
     auto addEntity = [this](const std::string& name, uint32_t materialId, const std::vector<Vertex>& vertices,
@@ -441,7 +490,7 @@ bool Scene::initOcean(D3D12Device& device) {
         ent.mesh.indexOffset = indexOffset;
         ent.mesh.indexCount = static_cast<uint32_t>(localIndices.size());
         ent.mesh.localAABB = bounds;
-        m_allInstances.push_back({materialId, vertexOffset, indexOffset, 0});
+        m_allInstances.push_back({materialId, vertexOffset, indexOffset});
         m_entities.push_back(std::move(ent));
         return m_entities.size() - 1;
     };
@@ -549,6 +598,7 @@ bool Scene::initOcean(D3D12Device& device) {
         mat.roughness = item.buoy ? 0.28f : 0.38f;
         mat.metallic = item.buoy ? 0.05f : 0.0f;
         mat.emissive = 0.015f;
+        mat.emissiveColor = XMFLOAT4(item.color.x, item.color.y, item.color.z, 0.0f);
         mat.textureId = -1;
         mat.metallicRoughnessTextureId = -1;
         const uint32_t materialId = static_cast<uint32_t>(m_allMaterials.size());
@@ -602,6 +652,8 @@ bool Scene::initOcean(D3D12Device& device) {
 bool Scene::initReflectionLab(D3D12Device& device, const std::string& gltfPath) {
     m_isOceanScene = false;
     m_isReflectionLabScene = false;
+    m_textureArrayLayerCount = 0;
+    m_textureArrayResolution = 1024;
     m_sceneCbData = {};
     m_camera.moveSpeed = 6.0f;
     m_camera.lookSpeed = 0.15f;
@@ -726,8 +778,13 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
         std::cerr << "[Scene Error] Texture color-space metadata does not match texture-array layer count.\n";
         return false;
     }
-    const UINT texWidth = 1024;
-    const UINT texHeight = 1024;
+    const UINT texWidth = m_textureArrayResolution;
+    const UINT texHeight = m_textureArrayResolution;
+    if (texWidth == 0 || texWidth > D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION ||
+        (texWidth & (texWidth - 1u)) != 0) {
+        std::cerr << "[Scene Error] Texture-array resolution must be a supported power of two.\n";
+        return false;
+    }
     const UINT arraySize = textureUris.empty() ? 1 : static_cast<UINT>(textureUris.size());
     UINT mipLevels = 1;
     for (UINT dimension = std::max(texWidth, texHeight); dimension > 1; dimension >>= 1) ++mipLevels;
@@ -909,7 +966,7 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
     uploadBuffer->Unmap(0, nullptr);
 
     // Record copy commands
-    device.beginFrame();
+    if (!device.beginFrame()) return false;
     auto cmdList = device.getCommandList();
     for (UINT i = 0; i < subresourceCount; ++i) {
         D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
@@ -928,8 +985,11 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
     device.transitionBarrier(m_textureArray.Get(), D3D12_RESOURCE_STATE_COPY_DEST, 
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    device.endFrame();
-    device.waitForGpu();
+    if (!device.endFrame() || !device.waitForGpu()) {
+        std::cerr << "[Scene Error] Texture-array upload did not complete successfully.\n";
+        return false;
+    }
+
 
     // Create SRV in descriptor heap
     D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -949,8 +1009,262 @@ bool Scene::createTextureArray(D3D12Device& device, const std::vector<std::strin
         device.getSrvUavCpuHandle(m_textureArraySrvIndex)
     );
 
-    std::cout << "[Scene] Created Texture2DArray with " << arraySize 
-              << " layers (1024x1024 RGBA8, " << mipLevels << " color-correct mips), SRV index = " << m_textureArraySrvIndex << std::endl;
+    m_sceneCbData.textureArrayResolution = texWidth;
+    m_textureArrayLayerCount = arraySize;
+    std::cout << "[Scene] Created Texture2DArray with " << arraySize
+              << " layers (" << texWidth << 'x' << texHeight << " RGBA8, " << mipLevels
+              << " color-correct mips), SRV index = " << m_textureArraySrvIndex << std::endl;
+    return true;
+}
+
+bool Scene::createEnvironmentMaps(D3D12Device& device, const std::string& hdrPath, float intensity) {
+    constexpr uint32_t radianceWidth = 1024;
+    constexpr uint32_t radianceHeight = 512;
+    constexpr uint32_t irradianceWidth = 128;
+    constexpr uint32_t irradianceHeight = 64;
+    constexpr uint32_t irradianceSamples = 128;
+    constexpr float pi = 3.14159265358979323846f;
+
+    int sourceWidth = 0;
+    int sourceHeight = 0;
+    int sourceComponents = 0;
+    std::unique_ptr<float, decltype(&stbi_image_free)> sourcePixels(
+        stbi_loadf(hdrPath.c_str(), &sourceWidth, &sourceHeight, &sourceComponents, 3), &stbi_image_free);
+    if (!sourcePixels || sourceWidth < 2 || sourceHeight < 1 ||
+        std::abs(static_cast<double>(sourceWidth) / sourceHeight - 2.0) > 0.01 ||
+        !std::isfinite(intensity) || intensity < 0.0f) {
+        std::cerr << "[Environment Warning] Could not decode a valid 2:1 HDR environment map '" << hdrPath
+                  << "': " << (sourcePixels ? "invalid dimensions or intensity" : stbi_failure_reason()) << ".\n";
+        return false;
+    }
+    (void)sourceComponents;
+
+    const auto sampleSourceUv = [&](float u, float v) {
+        u -= std::floor(u); // Equirectangular longitude wraps across the seam.
+        v = std::clamp(v, 0.0f, 1.0f);
+        const float x = u * sourceWidth - 0.5f;
+        const float y = v * sourceHeight - 0.5f;
+        const int x0Unwrapped = static_cast<int>(std::floor(x));
+        const int x1Unwrapped = x0Unwrapped + 1;
+        const int x0 = (x0Unwrapped % sourceWidth + sourceWidth) % sourceWidth;
+        const int x1 = (x1Unwrapped % sourceWidth + sourceWidth) % sourceWidth;
+        const int y0Unclamped = static_cast<int>(std::floor(y));
+        const int y0 = std::clamp(y0Unclamped, 0, sourceHeight - 1);
+        const int y1 = std::clamp(y0Unclamped + 1, 0, sourceHeight - 1);
+        const float fx = x - std::floor(x);
+        const float fy = y - std::floor(y);
+        const auto fetch = [&](int px, int py, int channel) {
+            const size_t index = (static_cast<size_t>(py) * sourceWidth + px) * 3 + channel;
+            const float value = sourcePixels.get()[index];
+            return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0e6f) : 0.0f;
+        };
+        float sampledChannels[3] = {};
+        for (int channel = 0; channel < 3; ++channel) {
+            const float top = fetch(x0, y0, channel) * (1.0f - fx) + fetch(x1, y0, channel) * fx;
+            const float bottom = fetch(x0, y1, channel) * (1.0f - fx) + fetch(x1, y1, channel) * fx;
+            sampledChannels[channel] = top * (1.0f - fy) + bottom * fy;
+        }
+        return XMFLOAT3(sampledChannels[0], sampledChannels[1], sampledChannels[2]);
+    };
+    const auto directionToUv = [pi](const Vec3& direction) {
+        const Vec3 d = direction.normalized();
+        return XMFLOAT2(std::atan2(d.z, d.x) / (2.0f * pi) + 0.5f,
+                        std::acos(std::clamp(d.y, -1.0f, 1.0f)) / pi);
+    };
+
+    std::vector<XMFLOAT4> radianceBase(static_cast<size_t>(radianceWidth) * radianceHeight);
+    for (uint32_t y = 0; y < radianceHeight; ++y) {
+        for (uint32_t x = 0; x < radianceWidth; ++x) {
+            XMFLOAT3 sum{};
+            constexpr uint32_t downsampleGrid = 4;
+            for (uint32_t sy = 0; sy < downsampleGrid; ++sy) {
+                for (uint32_t sx = 0; sx < downsampleGrid; ++sx) {
+                    const float u = (static_cast<float>(x) + (static_cast<float>(sx) + 0.5f) / downsampleGrid) / radianceWidth;
+                    const float v = (static_cast<float>(y) + (static_cast<float>(sy) + 0.5f) / downsampleGrid) / radianceHeight;
+                    const XMFLOAT3 sample = sampleSourceUv(u, v);
+                    sum.x += sample.x; sum.y += sample.y; sum.z += sample.z;
+                }
+            }
+            const float scale = 1.0f / static_cast<float>(downsampleGrid * downsampleGrid);
+            radianceBase[static_cast<size_t>(y) * radianceWidth + x] =
+                XMFLOAT4(sum.x * scale, sum.y * scale, sum.z * scale, 1.0f);
+        }
+    }
+
+    std::vector<std::vector<XMFLOAT4>> radianceMips;
+    radianceMips.push_back(std::move(radianceBase));
+    uint32_t mipWidth = radianceWidth;
+    uint32_t mipHeight = radianceHeight;
+    while (mipWidth > 1 || mipHeight > 1) {
+        const uint32_t nextWidth = std::max(mipWidth / 2, 1u);
+        const uint32_t nextHeight = std::max(mipHeight / 2, 1u);
+        std::vector<XMFLOAT4> next(static_cast<size_t>(nextWidth) * nextHeight);
+        const std::vector<XMFLOAT4>& previous = radianceMips.back();
+        for (uint32_t y = 0; y < nextHeight; ++y) {
+            for (uint32_t x = 0; x < nextWidth; ++x) {
+                XMFLOAT4 sum{};
+                for (uint32_t oy = 0; oy < 2; ++oy) {
+                    for (uint32_t ox = 0; ox < 2; ++ox) {
+                        const XMFLOAT4& value = previous[static_cast<size_t>(std::min(y * 2 + oy, mipHeight - 1)) * mipWidth +
+                                                          std::min(x * 2 + ox, mipWidth - 1)];
+                        sum.x += value.x; sum.y += value.y; sum.z += value.z;
+                    }
+                }
+                next[static_cast<size_t>(y) * nextWidth + x] = XMFLOAT4(sum.x * 0.25f, sum.y * 0.25f,
+                                                                         sum.z * 0.25f, 1.0f);
+            }
+        }
+        radianceMips.push_back(std::move(next));
+        mipWidth = nextWidth;
+        mipHeight = nextHeight;
+    }
+
+    const auto radicalInverseVdc = [](uint32_t bits) {
+        bits = (bits << 16u) | (bits >> 16u);
+        bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+        bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+        bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+        bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+        return static_cast<float>(bits) * 2.3283064365386963e-10f;
+    };
+    std::vector<XMFLOAT4> irradiancePixels(static_cast<size_t>(irradianceWidth) * irradianceHeight);
+    for (uint32_t y = 0; y < irradianceHeight; ++y) {
+        for (uint32_t x = 0; x < irradianceWidth; ++x) {
+            const float u = (static_cast<float>(x) + 0.5f) / irradianceWidth;
+            const float v = (static_cast<float>(y) + 0.5f) / irradianceHeight;
+            const float longitude = (u - 0.5f) * (2.0f * pi);
+            const float latitude = v * pi;
+            const Vec3 normal(std::sin(latitude) * std::cos(longitude), std::cos(latitude),
+                              std::sin(latitude) * std::sin(longitude));
+            const Vec3 helper = std::abs(normal.y) < 0.999f ? Vec3(0.0f, 1.0f, 0.0f) : Vec3(1.0f, 0.0f, 0.0f);
+            const Vec3 tangent = Vec3::cross(helper, normal).normalized();
+            const Vec3 bitangent = Vec3::cross(normal, tangent).normalized();
+            XMFLOAT3 sum{};
+            for (uint32_t i = 0; i < irradianceSamples; ++i) {
+                const float sampleU = (static_cast<float>(i) + 0.5f) / irradianceSamples;
+                const float sampleV = radicalInverseVdc(i);
+                const float radius = std::sqrt(sampleU);
+                const float phi = 2.0f * pi * sampleV;
+                const Vec3 direction = tangent * (radius * std::cos(phi)) +
+                    bitangent * (radius * std::sin(phi)) + normal * std::sqrt(std::max(1.0f - sampleU, 0.0f));
+                const XMFLOAT2 uv = directionToUv(direction);
+                const XMFLOAT3 sample = sampleSourceUv(uv.x, uv.y);
+                sum.x += sample.x; sum.y += sample.y; sum.z += sample.z;
+            }
+            const float inverseSamples = 1.0f / irradianceSamples;
+            irradiancePixels[static_cast<size_t>(y) * irradianceWidth + x] =
+                XMFLOAT4(sum.x * inverseSamples, sum.y * inverseSamples, sum.z * inverseSamples, 1.0f);
+        }
+    }
+    sourcePixels.reset();
+
+    const auto uploadFloatTexture = [&](const std::vector<std::vector<XMFLOAT4>>& mips,
+                                        uint32_t width, uint32_t height,
+                                        ComPtr<ID3D12Resource>& resource) {
+        if (mips.empty() || mips.size() > std::numeric_limits<UINT16>::max()) return false;
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = static_cast<UINT16>(mips.size());
+        desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        D3D12_HEAP_PROPERTIES defaultHeap = {};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        defaultHeap.CreationNodeMask = 1;
+        defaultHeap.VisibleNodeMask = 1;
+        if (FAILED(device.getDevice()->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&resource)))) return false;
+
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mips.size());
+        std::vector<UINT> rowCounts(mips.size());
+        std::vector<UINT64> rowSizes(mips.size());
+        UINT64 uploadSize = 0;
+        device.getDevice()->GetCopyableFootprints(&desc, 0, static_cast<UINT>(mips.size()), 0,
+            footprints.data(), rowCounts.data(), rowSizes.data(), &uploadSize);
+        ComPtr<ID3D12Resource> upload = device.createBuffer(uploadSize, D3D12_HEAP_TYPE_UPLOAD,
+            D3D12_RESOURCE_STATE_GENERIC_READ);
+        if (!upload || uploadSize == 0) return false;
+        uint8_t* mapped = nullptr;
+        D3D12_RANGE readRange{0, 0};
+        if (FAILED(upload->Map(0, &readRange, reinterpret_cast<void**>(&mapped))) || !mapped) return false;
+        uint32_t mipW = width;
+        uint32_t mipH = height;
+        for (UINT mip = 0; mip < mips.size(); ++mip) {
+            if (mips[mip].size() != static_cast<size_t>(mipW) * mipH ||
+                rowSizes[mip] != static_cast<UINT64>(mipW) * sizeof(XMFLOAT4)) {
+                upload->Unmap(0, nullptr);
+                return false;
+            }
+            for (UINT row = 0; row < rowCounts[mip]; ++row) {
+                std::memcpy(mapped + footprints[mip].Offset + static_cast<size_t>(row) * footprints[mip].Footprint.RowPitch,
+                    mips[mip].data() + static_cast<size_t>(row) * mipW,
+                    static_cast<size_t>(rowSizes[mip]));
+            }
+            mipW = std::max(mipW / 2, 1u);
+            mipH = std::max(mipH / 2, 1u);
+        }
+        upload->Unmap(0, nullptr);
+        if (!device.beginFrame()) return false;
+        ID3D12GraphicsCommandList* commands = device.getCommandList();
+        if (!commands) {
+            device.endFrame();
+            return false;
+        }
+        for (UINT mip = 0; mip < mips.size(); ++mip) {
+            D3D12_TEXTURE_COPY_LOCATION destination = {};
+            destination.pResource = resource.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.SubresourceIndex = mip;
+            D3D12_TEXTURE_COPY_LOCATION source = {};
+            source.pResource = upload.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            source.PlacedFootprint = footprints[mip];
+            commands->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        }
+        device.transitionBarrier(resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        return device.endFrame() && device.waitForGpu();
+    };
+
+    std::vector<std::vector<XMFLOAT4>> irradianceMips;
+    irradianceMips.push_back(std::move(irradiancePixels));
+    if (!uploadFloatTexture(radianceMips, radianceWidth, radianceHeight, m_environmentMap) ||
+        !uploadFloatTexture(irradianceMips, irradianceWidth, irradianceHeight, m_environmentIrradiance)) {
+        std::cerr << "[Environment Warning] HDR environment texture upload failed for '" << hdrPath << "'.\n";
+        m_environmentMap.Reset();
+        m_environmentIrradiance.Reset();
+        return false;
+    }
+
+    m_environmentSrvIndex = device.allocateSrvUavDescriptor();
+    const uint32_t irradianceSrvIndex = device.allocateSrvUavDescriptor();
+    if (m_environmentSrvIndex == std::numeric_limits<uint32_t>::max() ||
+        irradianceSrvIndex != m_environmentSrvIndex + 1u) {
+        std::cerr << "[Environment Warning] Could not reserve contiguous HDR environment SRVs.\n";
+        m_environmentSrvIndex = std::numeric_limits<uint32_t>::max();
+        return false;
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MostDetailedMip = 0;
+    srv.Texture2D.MipLevels = static_cast<UINT>(radianceMips.size());
+    device.getDevice()->CreateShaderResourceView(m_environmentMap.Get(), &srv,
+        device.getSrvUavCpuHandle(m_environmentSrvIndex));
+    srv.Texture2D.MipLevels = 1;
+    device.getDevice()->CreateShaderResourceView(m_environmentIrradiance.Get(), &srv,
+        device.getSrvUavCpuHandle(irradianceSrvIndex));
+    m_sceneCbData.environmentMapEnabled = 1;
+    m_sceneCbData.environmentIntensity = intensity;
+    m_sceneCbData.environmentMapMaxMip = static_cast<float>(radianceMips.size() - 1u);
+    std::cout << "[Environment] Loaded HDR '" << hdrPath << "' at intensity " << intensity
+              << ", radiance=" << radianceWidth << 'x' << radianceHeight << " with " << radianceMips.size()
+              << " mips, diffuse convolution=" << irradianceWidth << 'x' << irradianceHeight
+              << " (" << irradianceSamples << " cosine-weighted samples/texel).\n";
     return true;
 }
 
@@ -961,6 +1275,24 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
     if (!scene || !scene->mRootNode || scene->mNumMeshes == 0) {
         std::cerr << "[Scene] Assimp failed to load " << path << ": " << aiGetErrorString() << std::endl;
         return false;
+    }
+
+    m_hasImportedCamera = false;
+    if (scene->mNumCameras > 0 && scene->mCameras && scene->mCameras[0]) {
+        const aiCamera* importedCamera = scene->mCameras[0];
+        const Vec3 position(importedCamera->mPosition.x, importedCamera->mPosition.y, importedCamera->mPosition.z);
+        const Vec3 forward(importedCamera->mLookAt.x, importedCamera->mLookAt.y, importedCamera->mLookAt.z);
+        const float forwardLength = forward.length();
+        if (std::isfinite(position.x) && std::isfinite(position.y) && std::isfinite(position.z) &&
+            std::isfinite(forwardLength) && forwardLength > 1.0e-6f) {
+            m_importedCameraPosition = position;
+            m_importedCameraForward = forward / forwardLength;
+            m_hasImportedCamera = true;
+            std::cout << "[Scene] Preserved embedded camera '" << importedCamera->mName.C_Str()
+                      << "' from " << std::filesystem::path(path).filename().string() << ".\n";
+        } else {
+            std::cerr << "[Scene Warning] Ignored an invalid embedded camera in '" << path << "'.\n";
+        }
     }
 
     m_allVertices.clear();
@@ -981,8 +1313,51 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
     const std::filesystem::path assetDirectory = std::filesystem::path(path).parent_path();
     const auto resolveAssimpTexture = [&assetDirectory](const std::string& uri) {
         const std::filesystem::path source(uri);
-        return (source.is_absolute() ? source : assetDirectory / source).lexically_normal().string();
+        std::filesystem::path resolved = (source.is_absolute() ? source : assetDirectory / source).lexically_normal();
+        if (!std::filesystem::exists(resolved)) {
+            std::string extension = resolved.extension().string();
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (extension == ".dds") {
+                std::filesystem::path pngFallback = resolved;
+                pngFallback.replace_extension(".png");
+                if (std::filesystem::exists(pngFallback)) resolved = std::move(pngFallback);
+            }
+        }
+        return resolved.string();
     };
+    std::unordered_map<std::string, int> assimpTextureLayerByPath;
+    const auto addAssimpTexture = [&](const std::string& uri, bool srgb, const char* role) {
+        const std::string resolved = resolveAssimpTexture(uri);
+        if (!std::filesystem::is_regular_file(resolved)) {
+            std::cerr << "[Scene Warning] Assimp " << role << " texture not found: " << resolved << ".\n";
+            return -1;
+        }
+        std::error_code canonicalError;
+        std::filesystem::path canonical = std::filesystem::weakly_canonical(resolved, canonicalError);
+        std::string key = (canonicalError ? std::filesystem::path(resolved).lexically_normal() : canonical).string();
+        std::transform(key.begin(), key.end(), key.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        key += srgb ? "|srgb" : "|linear";
+        auto& layerMap = assimpTextureLayerByPath;
+        auto& texturePathsForLayer = texturePaths;
+        auto& srgbLayersForLayer = srgbTextureLayers;
+        if (const auto existing = layerMap.find(key); existing != layerMap.end())
+            return existing->second;
+        if (texturePathsForLayer.size() >= D3D12_REQ_TEXTURE2D_ARRAY_AXIS_DIMENSION ||
+            texturePathsForLayer.size() >= static_cast<size_t>(std::numeric_limits<int>::max() - 2)) {
+            std::cerr << "[Scene Error] Assimp texture array exceeds the D3D12 or material-ID limit.\n";
+            return -1;
+        }
+        const int layer = static_cast<int>(texturePathsForLayer.size());
+        texturePathsForLayer.push_back(resolved);
+        srgbLayersForLayer.push_back(srgb ? 1u : 0u);
+        const int materialTextureId = layer;
+        layerMap.emplace(std::move(key), materialTextureId);
+        return materialTextureId;
+    };
+    uint32_t loadedNormalMaps = 0;
+    uint32_t loadedEmissiveMaps = 0;
     if (scene->mNumMaterials == 0) {
         MaterialData defaultMaterial = {};
         defaultMaterial.baseColor = XMFLOAT4(0.85f, 0.85f, 0.85f, 1.0f);
@@ -996,17 +1371,33 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
         const aiMaterial* mat = scene->mMaterials[i];
         MaterialData md = {};
         md.baseColor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-        md.metallic = 1.0f;
-        md.roughness = 1.0f;
+        // Assimp FBX materials commonly contain legacy diffuse/specular data,
+        // not glTF-style PBR factors. Treat an unspecified FBX surface as a
+        // dielectric with moderate roughness; defaulting it to metal destroys
+        // diffuse color and makes ordinary plaster/wood look wrong.
+        md.metallic = 0.0f;
+        md.roughness = 0.5f;
         md.emissive = 0.0f;
-        md.textureId = -1;
-        md.metallicRoughnessTextureId = -1;
         md.alphaCutoff = 0.0f;
 
-        // Assimp exposes these glTF PBR factors as linear material properties.
-        // glTF defaults both factors to 1 when omitted.
-        mat->Get(AI_MATKEY_METALLIC_FACTOR, md.metallic);
-        mat->Get(AI_MATKEY_ROUGHNESS_FACTOR, md.roughness);
+        // Read authored PBR factors where available. For legacy FBX materials,
+        // approximate roughness from the Phong exponent when no PBR factor is
+        // present: roughness ~= sqrt(2 / (shininess + 2)).
+        float authoredMetallic = 0.0f;
+        float authoredRoughness = 0.5f;
+        const bool hasMetallicFactor = mat->Get(AI_MATKEY_METALLIC_FACTOR, authoredMetallic) == AI_SUCCESS &&
+            std::isfinite(authoredMetallic);
+        const bool hasRoughnessFactor = mat->Get(AI_MATKEY_ROUGHNESS_FACTOR, authoredRoughness) == AI_SUCCESS &&
+            std::isfinite(authoredRoughness);
+        if (hasMetallicFactor) md.metallic = std::clamp(authoredMetallic, 0.0f, 1.0f);
+        if (hasRoughnessFactor) {
+            md.roughness = std::clamp(authoredRoughness, 0.04f, 1.0f);
+        } else {
+            float shininess = 0.0f;
+            if (mat->Get(AI_MATKEY_SHININESS, shininess) == AI_SUCCESS && std::isfinite(shininess)) {
+                md.roughness = std::clamp(std::sqrt(2.0f / (std::max(shininess, 0.0f) + 2.0f)), 0.04f, 1.0f);
+            }
+        }
 
         aiColor4D diffColor;
         if (aiGetMaterialColor(mat, AI_MATKEY_BASE_COLOR, &diffColor) == AI_SUCCESS ||
@@ -1018,27 +1409,54 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
         if (mat->GetTexture(aiTextureType_BASE_COLOR, 0, &texPath) == AI_SUCCESS ||
             mat->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
             std::string uri = texPath.C_Str();
-            const std::string fullPath = resolveAssimpTexture(uri);
-            if (std::filesystem::exists(fullPath)) {
-                md.textureId = static_cast<int>(texturePaths.size());
-                texturePaths.push_back(fullPath);
-                srgbTextureLayers.push_back(1);
-                md.baseColor = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
-            } else {
-                std::cerr << "[Scene Warning] Assimp base-color texture not found: " << fullPath << ".\n";
-            }
+            md.textureId = addAssimpTexture(uri, true, "base-color");
+            // Preserve the authored material factor. PBR base color is
+            // the sampled sRGB texture multiplied by this linear factor.
 
             // Foliage / Cutout detection
-            if (uri.find(".png") != std::string::npos && uri != "white.png") {
+            if (md.textureId != -1 && (uri.find(".png") != std::string::npos ||
+                uri.find(".dds") != std::string::npos) && uri != "white.png") {
                 md.alphaCutoff = 0.5f;
             }
         }
-        if (mat->GetTexture(aiTextureType_GLTF_METALLIC_ROUGHNESS, 0, &texPath) == AI_SUCCESS) {
-            const std::string metallicRoughnessPath = resolveAssimpTexture(texPath.C_Str());
-            if (std::filesystem::exists(metallicRoughnessPath)) {
-                md.metallicRoughnessTextureId = static_cast<int>(texturePaths.size());
-                texturePaths.push_back(metallicRoughnessPath);
-                srgbTextureLayers.push_back(0);
+        const aiReturn hasGlTfMetallicRoughness = mat->GetTexture(
+            aiTextureType_GLTF_METALLIC_ROUGHNESS, 0, &texPath);
+        if (hasGlTfMetallicRoughness == AI_SUCCESS) {
+            md.metallicRoughnessTextureId = addAssimpTexture(texPath.C_Str(), false, "metallic-roughness");
+            // A loaded glTF metallic-roughness map stores its roughness in G
+            // and metalness in B, so absent scalar factors are neutral multipliers.
+            if (md.metallicRoughnessTextureId != -1) {
+                if (!hasMetallicFactor) md.metallic = 1.0f;
+                if (!hasRoughnessFactor) md.roughness = 1.0f;
+            }
+        }
+
+        if (mat->GetTexture(aiTextureType_NORMALS, 0, &texPath) == AI_SUCCESS) {
+            md.normalTextureId = addAssimpTexture(texPath.C_Str(), false, "normal");
+            if (md.normalTextureId != -1) ++loadedNormalMaps;
+        }
+
+        aiColor3D emissiveColor(0.0f, 0.0f, 0.0f);
+        const bool hasEmissiveFactor = mat->Get(AI_MATKEY_COLOR_EMISSIVE, emissiveColor) == AI_SUCCESS;
+        float emissiveIntensity = 1.0f;
+        if (mat->Get(AI_MATKEY_EMISSIVE_INTENSITY, emissiveIntensity) != AI_SUCCESS ||
+            !std::isfinite(emissiveIntensity) || emissiveIntensity < 0.0f) {
+            emissiveIntensity = 1.0f;
+        }
+        if (hasEmissiveFactor) {
+            md.emissiveColor = XMFLOAT4(emissiveColor.r, emissiveColor.g, emissiveColor.b, 0.0f);
+            md.emissive = emissiveIntensity;
+        }
+        if (mat->GetTexture(aiTextureType_EMISSIVE, 0, &texPath) == AI_SUCCESS) {
+            md.emissiveTextureId = addAssimpTexture(texPath.C_Str(), true, "emissive");
+            if (md.emissiveTextureId != -1) {
+                ++loadedEmissiveMaps;
+                // Some FBX files provide only an emissive map and no factor;
+                // in that case treat the map as authored radiance.
+                if (!hasEmissiveFactor) {
+                    md.emissiveColor = XMFLOAT4(1.0f, 1.0f, 1.0f, 0.0f);
+                    md.emissive = emissiveIntensity;
+                }
             }
         }
         // Assimp omits glTF texture slots when the referenced image is absent, so
@@ -1046,7 +1464,7 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
         // Read the source glTF material references and apply the fallback in either
         // case; do not silently leave the glTF default (metallic=1, roughness=1).
         if (isBundledSponza && i < missingSourceMetallicRoughnessMaps.size() &&
-            missingSourceMetallicRoughnessMaps[i] && md.metallicRoughnessTextureId < 0) {
+            missingSourceMetallicRoughnessMaps[i] && md.metallicRoughnessTextureId == -1) {
             md.metallic = 0.0f;
             md.roughness = 0.65f;
             const char* role = "dielectric-stone";
@@ -1071,6 +1489,8 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
         aiReleaseImport(scene);
         return false;
     }
+    std::cout << "[Scene] Assimp material maps: " << texturePaths.size() << " unique color/data layers, "
+              << loadedNormalMaps << " normal bindings, " << loadedEmissiveMaps << " emissive bindings.\n";
 
     // 3. Extract meshes into vertices, indices, instances, and entities
     for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
@@ -1109,8 +1529,9 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
 
         SceneEntity ent;
         ent.id = m_nextEntityId++;
-        ent.sourceNodePath = "Sponza meshes";
-        ent.name.name = mesh->mName.length > 0 ? mesh->mName.C_Str() : ("Sponza_Submesh_" + std::to_string(ent.id));
+        ent.sourceNodePath = std::filesystem::path(path).stem().string() + " meshes";
+        ent.name.name = mesh->mName.length > 0 ? mesh->mName.C_Str()
+            : (std::filesystem::path(path).stem().string() + "_Submesh_" + std::to_string(ent.id));
         ent.transform.position = Vec3(0.0f, 0.0f, 0.0f);
         ent.transform.scale = Vec3(1.0f, 1.0f, 1.0f);
 
@@ -1141,7 +1562,8 @@ bool Scene::loadAssimp(D3D12Device& device, const std::string& path) {
         sceneBounds.expand(Vec3(v.position.x, v.position.y, v.position.z));
     }
 
-    std::cout << "[Scene] Assimp loaded Sponza: " << m_entities.size() << " submeshes, " 
+    const std::string assetName = std::filesystem::path(path).stem().string();
+    std::cout << "[Scene] Assimp loaded '" << assetName << "': " << m_entities.size() << " submeshes, "
               << m_allVertices.size() << " vertices, " << m_allIndices.size() / 3 << " triangles."
               << " Bounds: X[" << sceneBounds.min.x << ", " << sceneBounds.max.x << "] "
               << "Y[" << sceneBounds.min.y << ", " << sceneBounds.max.y << "] "
@@ -1224,8 +1646,6 @@ bool Scene::loadGltf(D3D12Device& device, const std::string& path) {
     defaultMaterial.baseColor = XMFLOAT4(0.85f, 0.85f, 0.85f, 1.0f);
     defaultMaterial.metallic = 0.0f;
     defaultMaterial.roughness = 0.5f;
-    defaultMaterial.textureId = -1;
-    defaultMaterial.metallicRoughnessTextureId = -1;
     m_allMaterials.push_back(defaultMaterial);
 
     for (cgltf_size i = 0; i < data->materials_count; ++i) {
@@ -1234,8 +1654,6 @@ bool Scene::loadGltf(D3D12Device& device, const std::string& path) {
         imported.baseColor = XMFLOAT4(0.85f, 0.85f, 0.85f, 1.0f);
         imported.metallic = 1.0f;
         imported.roughness = 1.0f;
-        imported.textureId = -1;
-        imported.metallicRoughnessTextureId = -1;
         if (material.has_pbr_metallic_roughness) {
             const auto& pbr = material.pbr_metallic_roughness;
             imported.baseColor = XMFLOAT4(pbr.base_color_factor[0], pbr.base_color_factor[1],
@@ -1256,7 +1674,14 @@ bool Scene::loadGltf(D3D12Device& device, const std::string& path) {
         imported.roughness = std::isfinite(imported.roughness) ? std::clamp(imported.roughness, 0.04f, 1.0f) : 0.5f;
         const float emissive = std::max({material.emissive_factor[0], material.emissive_factor[1],
                                          material.emissive_factor[2]});
-        imported.emissive = std::isfinite(emissive) ? std::max(emissive, 0.0f) : 0.0f;
+        imported.emissiveColor = XMFLOAT4(
+            std::isfinite(material.emissive_factor[0]) ? std::max(material.emissive_factor[0], 0.0f) : 0.0f,
+            std::isfinite(material.emissive_factor[1]) ? std::max(material.emissive_factor[1], 0.0f) : 0.0f,
+            std::isfinite(material.emissive_factor[2]) ? std::max(material.emissive_factor[2], 0.0f) : 0.0f,
+            0.0f);
+        imported.emissive = std::isfinite(emissive) && emissive > 0.0f ? 1.0f : 0.0f;
+        imported.normalTextureId = addExternalTexture(material.normal_texture, false);
+        imported.emissiveTextureId = addExternalTexture(material.emissive_texture, true);
         if (material.alpha_mode == cgltf_alpha_mode_mask) {
             imported.alphaCutoff = std::isfinite(material.alpha_cutoff)
                 ? std::clamp(material.alpha_cutoff, 0.0f, 1.0f) : 0.5f;
@@ -1282,8 +1707,10 @@ bool Scene::loadGltf(D3D12Device& device, const std::string& path) {
         cgltf_node_transform_world(root, worldMatrix);
         bool matrixFinite = true;
         for (float value : worldMatrix) matrixFinite = matrixFinite && std::isfinite(value);
-        if (!matrixFinite) {
-            std::cerr << "[glTF Error] Non-finite world transform on node '"
+        double worldDeterminant = 0.0;
+        const bool matrixInvertible = matrixFinite && getGltfLinearDeterminant(worldMatrix, worldDeterminant);
+        if (!matrixInvertible) {
+            std::cerr << "[glTF Error] Non-finite or singular world transform on node '"
                       << (root->name ? root->name : "(unnamed)") << "'.\n";
         } else if (root->mesh) {
             for (cgltf_size primitiveIndex = 0; primitiveIndex < root->mesh->primitives_count; ++primitiveIndex) {
@@ -1386,13 +1813,14 @@ bool Scene::loadGltf(D3D12Device& device, const std::string& path) {
 
                 if (!normals) {
                     std::vector<Vec3> normalSums(localVertices.size(), Vec3(0.0f));
+                    const float orientationSign = worldDeterminant < 0.0 ? -1.0f : 1.0f;
                     for (size_t index = 0; index < localIndices.size(); index += 3) {
                         const Vertex& a = localVertices[localIndices[index]];
                         const Vertex& b = localVertices[localIndices[index + 1]];
                         const Vertex& c = localVertices[localIndices[index + 2]];
                         const Vec3 edge1 = Vec3(b.position.x - a.position.x, b.position.y - a.position.y, b.position.z - a.position.z);
                         const Vec3 edge2 = Vec3(c.position.x - a.position.x, c.position.y - a.position.y, c.position.z - a.position.z);
-                        const Vec3 faceNormal = Vec3::cross(edge1, edge2);
+                        const Vec3 faceNormal = Vec3::cross(edge1, edge2) * orientationSign;
                         if (!std::isfinite(faceNormal.x) || !std::isfinite(faceNormal.y) || !std::isfinite(faceNormal.z)) {
                             primitiveValid = false;
                             break;
@@ -1558,6 +1986,7 @@ void Scene::buildProceduralSponza(std::vector<Vertex>& outVertices, std::vector<
         mat.baseColor = color;
         mat.metallic = metallic;
         mat.roughness = roughness;
+        mat.emissiveColor = XMFLOAT4(color.x, color.y, color.z, 0.0f);
         mat.textureId = -1;
         mat.metallicRoughnessTextureId = -1;
         m_allMaterials.push_back(mat);
@@ -1633,6 +2062,7 @@ void Scene::buildProceduralSponza(std::vector<Vertex>& outVertices, std::vector<
 
 void Scene::update(float dt, const Window& window, float viewportX, float viewportY, float viewportW,
                    float viewportH, float renderAspect, uint32_t renderHeight, uint32_t frameIndex) {
+    const float movementDt = std::isfinite(dt) && dt > 0.0f ? std::min(dt, 0.1f) : 0.0f;
     m_sceneCbFrameIndex = frameIndex % D3D12Device::FRAME_COUNT;
     m_renderHeight = std::max(1u, renderHeight);
     m_frameCount++;
@@ -1650,12 +2080,12 @@ void Scene::update(float dt, const Window& window, float viewportX, float viewpo
         const Vec3 right = m_camera.getRight();
         const Vec3 up = Vec3(0.0f, 1.0f, 0.0f);
 
-        if (window.isKeyDown('W')) m_camera.position += fwd * speed * dt;
-        if (window.isKeyDown('S')) m_camera.position -= fwd * speed * dt;
-        if (window.isKeyDown('D')) m_camera.position += right * speed * dt;
-        if (window.isKeyDown('A')) m_camera.position -= right * speed * dt;
-        if (window.isKeyDown(VK_SPACE) || window.isKeyDown('E')) m_camera.position += up * speed * dt;
-        if (window.isKeyDown(VK_CONTROL) || window.isKeyDown('Q')) m_camera.position -= up * speed * dt;
+        if (window.isKeyDown('W')) m_camera.position += fwd * speed * movementDt;
+        if (window.isKeyDown('S')) m_camera.position -= fwd * speed * movementDt;
+        if (window.isKeyDown('D')) m_camera.position += right * speed * movementDt;
+        if (window.isKeyDown('A')) m_camera.position -= right * speed * movementDt;
+        if (window.isKeyDown(VK_SPACE) || window.isKeyDown('E')) m_camera.position += up * speed * movementDt;
+        if (window.isKeyDown(VK_CONTROL) || window.isKeyDown('Q')) m_camera.position -= up * speed * movementDt;
 
         // Mouse look with Right Mouse Button
         if (window.isMouseButtonDown(1)) {
@@ -1677,12 +2107,12 @@ void Scene::update(float dt, const Window& window, float viewportX, float viewpo
                      std::abs(m_camera.position.z - m_lastCameraPos.z) > 0.0005f ||
                      std::abs(m_camera.yaw - m_lastCameraYaw) > 0.005f ||
                      std::abs(m_camera.pitch - m_lastCameraPitch) > 0.005f);
-    // A stationary Sponza scene can retain NRD's world-space history while the
-    // camera moves; NRD reprojects it from the previous camera matrices. Reset
-    // only on an explicit lighting/material/scene change. The ocean has NRD
-    // disabled and keeps the conventional camera-motion reset behavior.
+    // A stationary architectural scene can retain NRD's world-space history
+    // while the camera moves; NRD reprojects it from the previous camera
+    // matrices. Reset only on an explicit lighting/material/scene change. The
+    // ocean has NRD disabled and keeps conventional camera-motion resets.
     const bool useNrdCameraReprojection = !m_isOceanScene &&
-        m_sceneCbData.renderMode == 0 && m_sceneCbData.enableNRD != 0;
+        m_sceneCbData.renderMode <= 1u && m_sceneCbData.enableNRD != 0;
     if (m_freezeSampleSeedForValidation) {
         // Each A/B state replays the same low-discrepancy sample sequence and
         // accumulates it from a clean history. This reduces reflection variance
@@ -1697,21 +2127,24 @@ void Scene::update(float dt, const Window& window, float viewportX, float viewpo
         m_accumFrameCount = 1;
         m_accumResetPending = false;
     } else {
-        m_accumFrameCount++;
+        // Shader accumulation is clamped to 256 samples; saturating here keeps
+        // the temporal denominator stable and prevents uint wraparound.
+        if (m_accumFrameCount < 256u) ++m_accumFrameCount;
     }
 
     if (m_isOceanScene) updateOceanPhysics(dt);
 
     // Ray pick on Left Click
-    if (window.isMouseButtonDown(0) && !m_isLooking) {
+    if (window.wasMouseButtonPressed(0) && !m_isLooking) {
         Vec2 mPos = window.getMousePos();
         float relX = mPos.x - viewportX;
         float relY = mPos.y - viewportY;
         if (relX >= 0.0f && relX <= viewportW && relY >= 0.0f && relY <= viewportH) {
-            EntityID hit = rayPick(relX, relY, viewportW, viewportH);
-            if (hit != NULL_ENTITY) {
-                m_selectedEntityId = hit;
-            }
+            Vec3 localHit(0.0f);
+            EntityID hit = rayPick(relX, relY, viewportW, viewportH, &localHit);
+            // A click on empty viewport space clears selection. This also makes
+            // the visual selection overlay follow the editor's current state.
+            setSelectedEntityId(hit, hit != NULL_ENTITY ? &localHit : nullptr);
         }
     }
 }
@@ -1869,14 +2302,16 @@ void Scene::updateOceanPhysics(float dt) {
     m_accumResetPending = false;
 }
 
-EntityID Scene::rayPick(float screenX, float screenY, float viewportW, float viewportH) {
+EntityID Scene::rayPick(float screenX, float screenY, float viewportW, float viewportH, Vec3* outLocalHit) {
+    if (outLocalHit) *outLocalHit = Vec3(0.0f);
     if (!std::isfinite(screenX) || !std::isfinite(screenY) || !std::isfinite(viewportW) ||
         !std::isfinite(viewportH) || viewportW <= 0.0f || viewportH <= 0.0f) return NULL_ENTITY;
 
     float ndcX = (screenX / viewportW) * 2.0f - 1.0f;
     float ndcY = 1.0f - (screenY / viewportH) * 2.0f;
 
-    float aspect = viewportW / viewportH;
+    const float aspect = std::clamp(std::isfinite(m_viewportAspect) && m_viewportAspect > 1.0e-4f
+        ? m_viewportAspect : viewportW / viewportH, 1.0e-4f, 1.0e4f);
     XMMATRIX V = m_camera.getViewMatrix();
     XMMATRIX P = m_camera.getProjMatrix(aspect);
     XMMATRIX VP = XMMatrixMultiply(V, P);
@@ -1901,8 +2336,26 @@ EntityID Scene::rayPick(float screenX, float screenY, float viewportW, float vie
 
     float closestT = 1e30f;
     EntityID bestId = NULL_ENTITY;
+    XMMATRIX bestWorld = XMMatrixIdentity();
 
     for (const auto& ent : m_entities) {
+        const Vec3 localMin = ent.mesh.localAABB.min;
+        const Vec3 localMax = ent.mesh.localAABB.max;
+        const auto finiteVec3 = [](const Vec3& value) {
+            return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+        };
+        if (!finiteVec3(ent.transform.position) || !finiteVec3(ent.transform.rotation) ||
+            !finiteVec3(ent.transform.scale) || !finiteVec3(localMin) || !finiteVec3(localMax) ||
+            std::abs(ent.transform.scale.x) <= 1.0e-8f ||
+            std::abs(ent.transform.scale.y) <= 1.0e-8f ||
+            std::abs(ent.transform.scale.z) <= 1.0e-8f ||
+            localMin.x > localMax.x || localMin.y > localMax.y || localMin.z > localMax.z ||
+            ent.mesh.vertexOffset > m_allVertices.size() ||
+            ent.mesh.vertexCount > m_allVertices.size() - ent.mesh.vertexOffset ||
+            ent.mesh.indexOffset > m_allIndices.size() ||
+            ent.mesh.indexCount > m_allIndices.size() - ent.mesh.indexOffset || ent.mesh.indexCount < 3) {
+            continue;
+        }
         const float pitch = ent.transform.rotation.x * (3.14159265f / 180.0f);
         const float yaw = ent.transform.rotation.y * (3.14159265f / 180.0f);
         const float roll = ent.transform.rotation.z * (3.14159265f / 180.0f);
@@ -1917,21 +2370,68 @@ EntityID Scene::rayPick(float screenX, float screenY, float viewportW, float vie
                 (corner & 4u) ? ent.mesh.localAABB.max.z : ent.mesh.localAABB.min.z, 1.0f);
             XMFLOAT3 transformed;
             XMStoreFloat3(&transformed, XMVector3TransformCoord(local, world));
+            if (!std::isfinite(transformed.x) || !std::isfinite(transformed.y) || !std::isfinite(transformed.z)) {
+                worldBounds = AABB{};
+                break;
+            }
             worldBounds.expand(Vec3(transformed.x, transformed.y, transformed.z));
         }
-        float t = 0.0f;
-        if (worldBounds.rayIntersect(rayOrig, rayDir, t)) {
-            if (t < closestT) {
+        float boundsT = 0.0f;
+        if (!worldBounds.rayIntersect(rayOrig, rayDir, boundsT)) continue;
+
+        const size_t meshIndexBegin = ent.mesh.indexOffset;
+        const size_t meshIndexEnd = meshIndexBegin + ent.mesh.indexCount;
+        for (size_t index = meshIndexBegin; index + 2 < meshIndexEnd; index += 3) {
+            const uint32_t localIndex0 = m_allIndices[index + 0];
+            const uint32_t localIndex1 = m_allIndices[index + 1];
+            const uint32_t localIndex2 = m_allIndices[index + 2];
+            if (localIndex0 >= ent.mesh.vertexCount || localIndex1 >= ent.mesh.vertexCount ||
+                localIndex2 >= ent.mesh.vertexCount) continue;
+
+            const auto worldVertex = [&ent, &world, this](uint32_t localIndex, Vec3& result) {
+                const XMFLOAT3& position = m_allVertices[ent.mesh.vertexOffset + localIndex].position;
+                if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z)) return false;
+                XMFLOAT3 transformed;
+                XMStoreFloat3(&transformed, XMVector3TransformCoord(
+                    XMVectorSet(position.x, position.y, position.z, 1.0f), world));
+                if (!std::isfinite(transformed.x) || !std::isfinite(transformed.y) || !std::isfinite(transformed.z)) return false;
+                result = Vec3(transformed.x, transformed.y, transformed.z);
+                return true;
+            };
+            Vec3 v0, v1, v2;
+            if (!worldVertex(localIndex0, v0) || !worldVertex(localIndex1, v1) || !worldVertex(localIndex2, v2)) continue;
+            float t = 0.0f;
+            if (rayTriangleIntersect(rayOrig, rayDir, v0, v1, v2, t) && t < closestT) {
                 closestT = t;
                 bestId = ent.id;
+                bestWorld = world;
             }
         }
+    }
+
+    if (bestId != NULL_ENTITY && outLocalHit) {
+        XMVECTOR worldDeterminant;
+        const XMMATRIX inverseWorld = XMMatrixInverse(&worldDeterminant, bestWorld);
+        float determinant = 0.0f;
+        XMStoreFloat(&determinant, worldDeterminant);
+        if (!std::isfinite(determinant) || std::abs(determinant) <= 1.0e-12f) return NULL_ENTITY;
+        const Vec3 worldHit = rayOrig + rayDir * closestT;
+        XMFLOAT3 localHit;
+        XMStoreFloat3(&localHit, XMVector3TransformCoord(
+            XMVectorSet(worldHit.x, worldHit.y, worldHit.z, 1.0f), inverseWorld));
+        if (!std::isfinite(localHit.x) || !std::isfinite(localHit.y) || !std::isfinite(localHit.z)) return NULL_ENTITY;
+        *outLocalHit = Vec3(localHit.x, localHit.y, localHit.z);
     }
 
     return bestId;
 }
 
-void Scene::updateGpuBuffers(D3D12Device& device) {
+bool Scene::updateGpuBuffers(D3D12Device& device, std::string* failureReason) {
+    if (failureReason) failureReason->clear();
+    const auto fail = [failureReason](const char* reason) {
+        if (failureReason) *failureReason = reason;
+        return false;
+    };
     if (m_materialsDirty) {
         if (m_allMaterials.size() > m_materialBufferCapacity || !m_materialBuffer) {
             std::cerr << "[Scene Error] Material edit exceeded the allocated GPU material capacity." << std::endl;
@@ -1941,35 +2441,44 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
         } else {
             // This is an infrequent editor operation. Drain prior frames before modifying
             // upload memory that an earlier DXR dispatch may still be reading.
-            device.waitForGpu();
+            if (!device.waitForGpu()) return fail("GPU drain failed before writing edited materials.");
             void* materialMapped = nullptr;
             D3D12_RANGE readRange = { 0, 0 };
-            if (SUCCEEDED(m_materialBuffer->Map(0, &readRange, &materialMapped))) {
-                std::memcpy(materialMapped, m_allMaterials.data(), sizeof(MaterialData) * m_allMaterials.size());
-                m_materialBuffer->Unmap(0, nullptr);
-
-                bool instancesUploaded = !m_instancesDirty;
-                if (m_instancesDirty && m_instanceBuffer) {
-                    void* instanceMapped = nullptr;
-                    if (SUCCEEDED(m_instanceBuffer->Map(0, &readRange, &instanceMapped))) {
-                        std::memcpy(instanceMapped, m_allInstances.data(), sizeof(InstanceData) * m_allInstances.size());
-                        m_instanceBuffer->Unmap(0, nullptr);
-                        instancesUploaded = true;
-                    }
-                }
-                if (instancesUploaded) {
-                    std::cout << "[Scene] Uploaded material edits: " << m_queuedMaterialEdits
-                        << " entity override(s); GPU materials=" << m_allMaterials.size() << std::endl;
-                    m_uploadedMaterialEdits = m_queuedMaterialEdits;
-                    m_materialsDirty = false;
-                    m_instancesDirty = false;
-                    m_queuedMaterialEdits = 0;
-                } else {
-                    std::cerr << "[Scene Error] Could not map the GPU instance buffer for a material override." << std::endl;
-                }
-            } else {
-                std::cerr << "[Scene Error] Could not map the GPU material buffer for an Inspector edit." << std::endl;
+            const HRESULT materialMapResult = m_materialBuffer->Map(0, &readRange, &materialMapped);
+            if (FAILED(materialMapResult) || !materialMapped) {
+                std::cerr << "[Scene Error] Could not map the GPU material buffer for an Inspector edit: HRESULT 0x"
+                          << std::hex << materialMapResult << std::dec << ".\n";
+                return fail("Could not map the material upload buffer.");
             }
+            if (!m_allMaterials.empty()) {
+                std::memcpy(materialMapped, m_allMaterials.data(), sizeof(MaterialData) * m_allMaterials.size());
+            }
+            m_materialBuffer->Unmap(0, nullptr);
+
+            if (m_instancesDirty) {
+                if (!m_instanceBuffer) {
+                    std::cerr << "[Scene Error] GPU instance buffer is missing for a material override.\n";
+                    return fail("Instance buffer is missing during a material edit.");
+                }
+                void* instanceMapped = nullptr;
+                const HRESULT instanceMapResult = m_instanceBuffer->Map(0, &readRange, &instanceMapped);
+                if (FAILED(instanceMapResult) || !instanceMapped) {
+                    std::cerr << "[Scene Error] Could not map the GPU instance buffer for a material override: HRESULT 0x"
+                              << std::hex << instanceMapResult << std::dec << ".\n";
+                    return fail("Could not map the instance upload buffer.");
+                }
+                if (!m_allInstances.empty()) {
+                    std::memcpy(instanceMapped, m_allInstances.data(), sizeof(InstanceData) * m_allInstances.size());
+                }
+                m_instanceBuffer->Unmap(0, nullptr);
+            }
+
+            std::cout << "[Scene] Uploaded material edits: " << m_queuedMaterialEdits
+                << " entity override(s); GPU materials=" << m_allMaterials.size() << std::endl;
+            m_uploadedMaterialEdits = m_queuedMaterialEdits;
+            m_materialsDirty = false;
+            m_instancesDirty = false;
+            m_queuedMaterialEdits = 0;
         }
     }
 
@@ -1991,7 +2500,7 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
             m_transformsDirty = false;
         } else {
             std::cerr << "[Scene Error] TLAS update failed; transform changes remain pending for retry.\n";
-            return;
+            return fail("TLAS update failed while applying scene transforms.");
         }
     }
 
@@ -2007,7 +2516,7 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
     XMStoreFloat(&determinant, determinantVector);
     if (!std::isfinite(determinant) || std::abs(determinant) <= 1.0e-12f) {
         std::cerr << "[Scene Error] Skipped GPU camera update because view-projection matrix is singular.\n";
-        return;
+        return fail("Camera view-projection matrix is singular or non-finite.");
     }
 
     XMStoreFloat4x4(&m_sceneCbData.viewProjInv, XMMatrixTranspose(invVP));
@@ -2022,14 +2531,16 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
         m_sceneCbData.frameCount = m_frameCount;
     }
     m_sceneCbData.accumFrameCount = m_accumFrameCount;
+    m_sceneCbData.dlssReset = m_accumFrameCount <= 1u ? 1u : 0u;
     m_sceneCbData.renderHeight = m_renderHeight;
-    m_sceneCbData.padPrev1 = m_oceanTime;
+    m_sceneCbData.oceanTime = m_oceanTime;
 
     Vec3 fwd = m_camera.getForward();
     Vec3 rgt = m_camera.getRight();
     Vec3 up  = m_camera.getUp();
     m_sceneCbData.camForward = XMFLOAT3(fwd.x, fwd.y, fwd.z);
     m_sceneCbData.fovY = m_camera.fov * (3.14159265f / 180.0f);
+    m_sceneCbData.cameraClipPlanes = XMFLOAT2(m_camera.nearPlane, m_camera.farPlane);
     m_sceneCbData.camRight = XMFLOAT3(rgt.x, rgt.y, rgt.z);
     m_sceneCbData.aspectRatio = aspect;
     m_sceneCbData.camUp = XMFLOAT3(up.x, up.y, up.z);
@@ -2072,23 +2583,39 @@ void Scene::updateGpuBuffers(D3D12Device& device) {
     };
     if (m_freezeSampleSeedForValidation) {
         m_sceneCbData.jitterOffset = XMFLOAT2(0.0f, 0.0f);
+        m_sceneCbData.prevJitterX = 0.0f;
+        m_sceneCbData.prevJitterY = 0.0f;
     } else {
         const uint32_t phase = m_frameCount % 16;
+        const uint32_t previousPhase = (phase + 15u) % 16u;
         m_sceneCbData.jitterOffset.x = halton2[phase] - 0.5f;
         m_sceneCbData.jitterOffset.y = halton3[phase] - 0.5f;
+        m_sceneCbData.prevJitterX = halton2[previousPhase] - 0.5f;
+        m_sceneCbData.prevJitterY = halton3[previousPhase] - 0.5f;
     }
 
     // Map and update SceneCB
     void* cbMapped = nullptr;
     D3D12_RANGE readRange = { 0, 0 }; // We do not intend to read from this resource on the CPU
     ComPtr<ID3D12Resource>& frameSceneCb = m_sceneCb[m_sceneCbFrameIndex];
-    if (frameSceneCb && SUCCEEDED(frameSceneCb->Map(0, &readRange, &cbMapped)) && cbMapped) {
+    const HRESULT sceneCbMapResult = frameSceneCb
+        ? frameSceneCb->Map(0, &readRange, &cbMapped) : E_POINTER;
+    if (SUCCEEDED(sceneCbMapResult) && cbMapped) {
         std::memcpy(cbMapped, &m_sceneCbData, sizeof(SceneCB));
         frameSceneCb->Unmap(0, nullptr);
     } else {
+        const HRESULT deviceRemovedReason = device.getDevice() ? device.getDevice()->GetDeviceRemovedReason() : E_POINTER;
         std::cerr << "[Scene Error] Could not map SceneCB for frame " << m_sceneCbFrameIndex
-                  << "; the GPU will retain its previous camera/scene parameters.\n";
+                  << "; map HRESULT=0x" << std::hex << static_cast<uint32_t>(sceneCbMapResult)
+                  << ", device-removed HRESULT=0x" << static_cast<uint32_t>(deviceRemovedReason)
+                  << std::dec << ".\n";
+        if (failureReason) {
+            *failureReason = "SceneCB map HRESULT " + std::to_string(static_cast<uint32_t>(sceneCbMapResult)) +
+                ", device-removed HRESULT " + std::to_string(static_cast<uint32_t>(deviceRemovedReason));
+        }
+        return false;
     }
+    return true;
 }
 
 } // namespace Engine

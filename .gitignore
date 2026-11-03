@@ -28,6 +28,13 @@
 /Screenshot 2026-10-15 021529.png
 /Sponza RT cpp.png
 
+# Local residue from the retired benchmark is excluded from repository changes.
+# cleanup_redundant.bat offers an interactive, repository-root-guarded cleanup.
+/assets/benchmark/bistro/
+/bistro reference *.png
+/docs/media/bistro-*.png
+/tools/extract_bistro_asset.py
+
 # Operating-system and temporary files
 Thumbs.db
 .DS_Store

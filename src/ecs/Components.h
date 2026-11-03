@@ -94,11 +94,12 @@ struct CameraComponent {
     }
 
     Vec3 getRight() const {
-        return Vec3::cross(getForward(), Vec3(0.0f, 1.0f, 0.0f)).normalized();
+        // Match DirectX's left-handed view matrix basis: right = up x forward.
+        return Vec3::cross(Vec3(0.0f, 1.0f, 0.0f), getForward()).normalized();
     }
 
     Vec3 getUp() const {
-        return Vec3::cross(getRight(), getForward()).normalized();
+        return Vec3::cross(getForward(), getRight()).normalized();
     }
 
     XMMATRIX getViewMatrix() const {

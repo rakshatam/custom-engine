@@ -108,7 +108,7 @@ def run_scene(exe: Path, khronos: bool, native_resolution: bool) -> bool:
         print("[Reflection Runner Error] Hardware DXR capability or active dispatch was not reported.", file=sys.stderr)
         return False
     expected_scene = "Khronos Metal/Rough Spheres" if khronos else "Sponza"
-    if f"[Reflection Test] Scene={expected_scene}, sampling direct PBR + DXR reflections." not in log:
+    if f"[Reflection Test] Scene={expected_scene}, sampling direct PBR + DXR reflections with NRD disabled." not in log:
         print(f"[Reflection Runner Error] Engine did not confirm the requested {label} scene.\n{log[-3000:]}", file=sys.stderr)
         return False
     if khronos and "[Reflection Lab] Loaded Khronos glTF PBR sample" not in log:

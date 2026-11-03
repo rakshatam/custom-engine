@@ -6,6 +6,8 @@
 #endif
 #include <windows.h>
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -39,11 +41,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     bool oceanTestMode = fullCmdLine.find("--ocean-test") != std::string::npos;
     bool oceanNoBodyDisplacement = fullCmdLine.find("--ocean-no-body-displacement") != std::string::npos;
     bool oceanGif30FpsMode = fullCmdLine.find("--ocean-gif-30fps") != std::string::npos;
+    float oceanReflectionStrength = 2.5f;
+    constexpr char reflectionStrengthArg[] = "--ocean-reflection-strength=";
+    const size_t reflectionStrengthOffset = fullCmdLine.find(reflectionStrengthArg);
+    if (reflectionStrengthOffset != std::string::npos) {
+        const size_t valueOffset = reflectionStrengthOffset + sizeof(reflectionStrengthArg) - 1;
+        try {
+            size_t parsedLength = 0;
+            const std::string strengthText = fullCmdLine.substr(valueOffset);
+            const float parsedStrength = std::stof(strengthText, &parsedLength);
+            const bool cleanArgumentEnd = parsedLength == strengthText.size() ||
+                (parsedLength < strengthText.size() && std::isspace(static_cast<unsigned char>(strengthText[parsedLength])));
+            if (!std::isfinite(parsedStrength) || !cleanArgumentEnd || parsedLength == 0 ||
+                parsedStrength < 1.0f || parsedStrength > 4.0f) {
+                MessageBoxA(nullptr, "Ocean reflection strength must be a finite number from 1.0 to 4.0.",
+                            "Invalid ocean reflection strength", MB_OK | MB_ICONERROR);
+                return -2;
+            }
+            oceanReflectionStrength = parsedStrength;
+        } catch (const std::exception&) {
+            MessageBoxA(nullptr, "Could not parse --ocean-reflection-strength. Use a number from 1.0 to 4.0.",
+                        "Invalid ocean reflection strength", MB_OK | MB_ICONERROR);
+            return -2;
+        }
+    }
     bool oceanSequenceMode = fullCmdLine.find("--ocean-sequence") != std::string::npos || oceanGif30FpsMode;
     bool reflectionCompareMode = fullCmdLine.find("--reflection-compare") != std::string::npos;
     bool khronosReflectionMode = fullCmdLine.find("--reflection-khronos") != std::string::npos;
-    bool testMode = oceanTestMode || reflectionCompareMode || (fullCmdLine.find("--test") != std::string::npos) || (fullCmdLine.find("-test") != std::string::npos);
-    bool nativeResolutionTest = !oceanTestMode && fullCmdLine.find("--native-resolution") != std::string::npos;
+    const bool dlssSrTestMode = fullCmdLine.find("--dlss-sr") != std::string::npos;
+    const bool dlssRrTestMode = fullCmdLine.find("--dlss-rr") != std::string::npos;
+    if (dlssSrTestMode && dlssRrTestMode) {
+        MessageBoxA(nullptr, "Choose one DLSS mode per run: --dlss-sr or --dlss-rr.",
+                    "Conflicting DLSS modes", MB_OK | MB_ICONERROR);
+        return -2;
+    }
+    const bool dlssTestMode = dlssSrTestMode || dlssRrTestMode;
+    bool testMode = oceanTestMode || reflectionCompareMode || dlssTestMode ||
+        (fullCmdLine.find("--test") != std::string::npos) || (fullCmdLine.find("-test") != std::string::npos);
+    bool nativeResolutionTest = fullCmdLine.find("--native-resolution") != std::string::npos || dlssTestMode;
 
     std::ofstream logFile("engine_run_log.txt");
     logFile << "[Engine] Initializing... TestMode: " << (testMode ? "true" : "false") << std::endl;
@@ -73,15 +108,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     EditorUI editorUI;
     editorUI.init(device, nativeResolutionTest);
+    if (dlssTestMode) editorUI.setDlssStartupMode(dlssSrTestMode, dlssRrTestMode);
     logFile << "[Engine] Render resolution: " << editorUI.getTargetRenderWidth() << 'x'
             << editorUI.getTargetRenderHeight() << std::endl;
 
     RayTracingPipeline pipeline;
-    if (!pipeline.init(device, editorUI.getTargetRenderWidth(), editorUI.getTargetRenderHeight())) {
+    if (!pipeline.init(device, editorUI.getTargetRenderWidth(), editorUI.getTargetRenderHeight(),
+                       editorUI.getTargetOutputWidth(), editorUI.getTargetOutputHeight())) {
         logFile << "[Engine Error] Failed to initialize Ray Tracing Pipeline." << std::endl;
         return -1;
     }
-    logFile << "[NRD] REBLUR diffuse denoiser: " << (pipeline.isNrdAvailable() ? "available" : "unavailable") << std::endl;
+    logFile << "[NRD] REBLUR diffuse+specular denoiser: "
+            << (pipeline.isNrdAvailable() ? "available" : "unavailable") << std::endl;
+    logFile << "[DLSS] " << pipeline.getDlssStatus() << std::endl;
+    std::string lastLoggedDlssStatus = pipeline.getDlssStatus();
 
     Scene sponzaScene;
     std::string gltfPath = "assets/sponza/Sponza.gltf";
@@ -102,13 +142,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
         oceanSceneInitialized = true;
         activeScene = &oceanScene;
+        oceanScene.getSceneCB().waterReflectionStrength = oceanReflectionStrength;
         if (oceanTestMode && fullCmdLine.find("--ocean-no-reflections") != std::string::npos) oceanScene.getSceneCB().enableRayTracedReflections = 0.0f;
         if (oceanTestMode && oceanNoBodyDisplacement) {
             logFile << "[Ocean Test] GPU body displacement field disabled for comparison." << std::endl;
         }
         logFile << (oceanTestMode ? "[Ocean Test]" : "[Water Demo]")
                 << " Initialized interactive ocean scene with Jolt bodies="
-                << oceanScene.getTotalInstances() - 1 << std::endl;
+                << oceanScene.getTotalInstances() - 1 << ", reflection strength="
+                << oceanScene.getSceneCB().waterReflectionStrength << 'x' << std::endl;
     }
     if (reflectionCompareMode) {
         if (khronosReflectionMode) {
@@ -129,16 +171,32 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         reflectionTestCb.enableRayTracedReflections = 1.0f;
         reflectionTestCb.enableShadows = 1;
         reflectionTestCb.enableTAA = 0;
+        // This is a direct-light A/B at identical deterministic samples. NRD
+        // is not needed for this mode, and its temporal state is independent
+        // of Scene accumulation resets, so keep it out of the comparison.
+        reflectionTestCb.enableNRD = 0;
         activeScene->setDeterministicSamplingForValidation(true);
         activeScene->resetAccumulation();
         logFile << "[Reflection Test] Scene=" << (khronosReflectionMode ? "Khronos Metal/Rough Spheres" : "Sponza")
-                << ", sampling direct PBR + DXR reflections.\n";
+                << ", sampling direct PBR + DXR reflections with NRD disabled.\n";
     }
-    if (testMode && !oceanTestMode && !reflectionCompareMode) sponzaScene.getSceneCB().renderMode = 0; // Sponza GI capture sequence.
-    if (!oceanTestMode && fullCmdLine.find("--no-nrd") != std::string::npos) {
-        sponzaScene.getSceneCB().enableNRD = 0;
-        logFile << "[NRD] Disabled by --no-nrd test override; using built-in accumulation." << std::endl;
+    if (testMode && !oceanTestMode && !reflectionCompareMode) {
+        activeScene->getSceneCB().renderMode = 0; // Begin the capture suite with GI in the selected scene.
     }
+    const bool disableNrdForRun = fullCmdLine.find("--no-nrd") != std::string::npos;
+    if (disableNrdForRun) {
+        activeScene->getSceneCB().enableNRD = 0;
+        logFile << "[NRD] Disabled by --no-nrd override for the active scene; using renderer temporal accumulation."
+                << std::endl;
+    }
+    const Vec3 testCameraStartPosition = activeScene->getCamera().position;
+    const float testCameraStartYaw = activeScene->getCamera().yaw;
+    const float testCameraStartPitch = activeScene->getCamera().pitch;
+    const Vec3 testSunStartDirection = activeScene->getSun().direction;
+    const Vec3 testSunStartColor = activeScene->getSun().color;
+    const float testSunStartIntensity = activeScene->getSun().intensity;
+    const float testExposureStart = activeScene->getSceneCB().exposure;
+    const float testShadowSoftness = activeScene->getSceneCB().shadowSoftness;
 
     ImGuiRenderer imguiRenderer;
     if (!imguiRenderer.init(device, window.getHwnd())) {
@@ -155,6 +213,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     uint32_t giFrameTimeCount = 0;
     double oceanFrameTimeSum = 0.0;
     uint32_t oceanFrameTimeCount = 0;
+    int exitCode = 0;
 
     logFile << "[Engine] Entering main render loop..." << std::endl;
 
@@ -191,8 +250,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (sceneRequest == 1) activeScene = &sponzaScene;
         else if (sceneRequest == 2 && oceanSceneInitialized) activeScene = &oceanScene;
         else if (sceneRequest == 3 && reflectionLabInitialized) activeScene = &reflectionLabScene;
-        if (activeScene != previousScene) activeScene->resetAccumulation();
+        if (activeScene != previousScene) {
+            if (disableNrdForRun) activeScene->getSceneCB().enableNRD = 0;
+            activeScene->resetAccumulation();
+        }
         Scene& scene = *activeScene;
+        const bool dlssSceneAllowed = pipeline.isDlssAvailable() && !scene.isOceanScene() &&
+            !scene.isReflectionLabScene() && scene.getSceneCB().renderMode <= 1u;
+        editorUI.setDlssSceneAllowed(dlssSceneAllowed);
 
         int needCapture = 0;
         int oceanSequenceCaptureFrame = 0;
@@ -285,18 +350,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                 scene.getSceneCB().renderMode = 2; // Normals
                 scene.resetAccumulation();
             } else if (frameNum == 115) {
-                logFile << "[Test Sequence] Frame 115: Restoring Path Traced GI & selecting Sponza entity in ECS Hierarchy" << std::endl;
+                logFile << "[Test Sequence] Frame 115: Restoring Path Traced GI & selecting a scene entity in ECS Hierarchy" << std::endl;
                 scene.getSceneCB().renderMode = 0;
                 scene.getSceneCB().toneMappingMode = 0;
-                scene.getSceneCB().exposure = 1.25f;
+                scene.getSceneCB().exposure = testExposureStart;
                 scene.getSceneCB().maxBounces = 1;
-                scene.getSun().direction = Vec3(-0.35f, -0.92f, 0.18f).normalized();
-                scene.getSun().color = Vec3(1.0f, 0.96f, 0.88f);
-                scene.getSun().intensity = 8.5f;
+                scene.getSun().direction = testSunStartDirection;
+                scene.getSun().color = testSunStartColor;
+                scene.getSun().intensity = testSunStartIntensity;
+                scene.getSceneCB().shadowSoftness = testShadowSoftness;
                 scene.resetAccumulation();
                 if (!scene.getEntities().empty()) {
                     scene.setSelectedEntityId(scene.getEntities().back().id);
                 }
+            } else if (frameNum == 146) {
+                // Return to the original view after the motion-reprojection
+                // stage so the late path capture can be compared at the same
+                // camera pose as the early sample capture.
+                scene.getCamera().position = testCameraStartPosition;
+                scene.getCamera().yaw = testCameraStartYaw;
+                scene.getCamera().pitch = testCameraStartPitch;
+                scene.resetAccumulation();
+                logFile << "[Test Sequence] Frame 146: restored the initial camera after the reprojection check.\n";
             } else if (frameNum == 232) {
                 logFile << "[Test Sequence] Frame 232: exercising per-entity Inspector material upload" << std::endl;
                 uint32_t editedEntities = 0;
@@ -312,8 +387,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
 
             if (frameNum >= 125 && frameNum <= 145) {
-                // Simulate camera flight motion to exercise temporal reprojection.
-                scene.getCamera().position.z += 0.04f;
+                // Move along the active view direction so this test exercises a
+                // camera flight for scenes with any authored yaw, not just +Z.
+                scene.getCamera().position += scene.getCamera().getForward() * 0.04f;
                 scene.getCamera().yaw += 0.08f;
             }
 
@@ -343,19 +419,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             else if (frameNum == 90) needCapture = 4;
             else if (frameNum == 110) needCapture = 5;
             else if (frameNum == 135) needCapture = 7;
+            else if (frameNum == 200) needCapture = 9; // Same view after a stationary denoising/accumulation window.
             else if (frameNum == 230) needCapture = 6; // Capture the ordinary editor before the material regression edit.
             else if (frameNum == 234) needCapture = 8; // Verify edited materials reached the DXR shader.
         }
 
         if (editorUI.hasResolutionChanged()) {
-            if (!pipeline.resizeOutput(device, editorUI.getTargetRenderWidth(), editorUI.getTargetRenderHeight())) {
+            if (!pipeline.resizeOutput(device, editorUI.getTargetRenderWidth(), editorUI.getTargetRenderHeight(),
+                                       editorUI.getTargetOutputWidth(), editorUI.getTargetOutputHeight())) {
                 logFile << "[DXR Error] Output resize failed; previous render resources and resolution remain active.\n";
             }
             scene.resetAccumulation();
             editorUI.clearResolutionChanged();
         }
 
+        pipeline.setDlssSettings(editorUI.isDlssSrEnabled(), editorUI.isDlssRrEnabled(),
+                                 editorUI.getDlssRenderScale(), editorUI.getDlssRrPreset());
+
         float renderAspect = static_cast<float>(pipeline.getRenderWidth()) / static_cast<float>(pipeline.getRenderHeight());
+        SceneCB& dlssSceneConstants = scene.getSceneCB();
+        const bool dlssSceneSupported = !scene.isOceanScene() && !scene.isReflectionLabScene();
+        const bool dlssRequested = (editorUI.isDlssSrEnabled() || editorUI.isDlssRrEnabled()) &&
+                                   pipeline.isDlssAvailable() && dlssSceneSupported && dlssSceneConstants.renderMode <= 1u;
+        dlssSceneConstants.enableDLSS = dlssRequested ? 1u : 0u;
+        dlssSceneConstants.enableDLSSRR = dlssRequested && editorUI.isDlssRrEnabled() ? 1u : 0u;
         scene.update(dt, window, editorUI.getViewportX(), editorUI.getViewportY(), editorUI.getViewportW(),
                      editorUI.getViewportH(), renderAspect, pipeline.getRenderHeight(), device.getFrameIndex());
         if (oceanTestMode && oceanNoBodyDisplacement && scene.isOceanScene()) {
@@ -377,10 +464,23 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
             logFile << std::endl;
         }
-        if (!pipeline.isNrdAvailable()) scene.getSceneCB().enableNRD = 0;
+        if (!pipeline.isNrdAvailable()) {
+            scene.getSceneCB().enableNRD = 0;
+        }
 
-        device.beginFrame();
-        scene.updateGpuBuffers(device);
+        if (!device.beginFrame()) {
+            logFile << "[D3D12 Error] Could not begin a render frame; stopping the render loop.\n";
+            exitCode = -1;
+            break;
+        }
+        std::string sceneUpdateFailure;
+        if (!scene.updateGpuBuffers(device, &sceneUpdateFailure)) {
+            logFile << "[Scene Error] GPU scene update failed (" << sceneUpdateFailure
+                    << "); stopping before dispatching stale scene data.\n";
+            device.endFrame(editorUI.isVsyncEnabled());
+            exitCode = -1;
+            break;
+        }
         const uint32_t uploadedMaterialEdits = scene.consumeUploadedMaterialEdits();
         if (uploadedMaterialEdits > 0) {
             logFile << "[Scene] Uploaded material edits: " << uploadedMaterialEdits << " entity override(s)." << std::endl;
@@ -389,7 +489,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const DirectX::XMMATRIX viewMatrix = scene.getCamera().getViewMatrix();
         const DirectX::XMMATRIX projectionMatrix = scene.getCamera().getProjMatrix(renderAspect);
 
-        pipeline.dispatch(
+        if (!pipeline.dispatch(
             device,
             scene.getTlas().getGpuAddress(),
             scene.getSceneCbGpuAddress(),
@@ -398,16 +498,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             scene.getMaterialBufferGpuAddress(),
             scene.getInstanceBufferGpuAddress(),
             device.getSrvUavGpuHandle(scene.getTextureArraySrvIndex()),
+            scene.getEnvironmentSrvIndex(),
             pipeline.getRenderWidth(),
             pipeline.getRenderHeight(),
             scene.getSceneCB(),
             projectionMatrix,
             viewMatrix
-        );
+        )) {
+            logFile << "[DXR Error] Ray dispatch validation failed; stopping before presenting stale output.\n";
+            device.endFrame(editorUI.isVsyncEnabled());
+            exitCode = -1;
+            break;
+        }
+        const std::string& currentDlssStatus = pipeline.getDlssStatus();
+        if (currentDlssStatus != lastLoggedDlssStatus) {
+            logFile << "[DLSS] " << currentDlssStatus << " (render " << pipeline.getRenderWidth() << 'x'
+                    << pipeline.getRenderHeight() << " -> output " << pipeline.getOutputWidth() << 'x'
+                    << pipeline.getOutputHeight() << ")." << std::endl;
+            lastLoggedDlssStatus = currentDlssStatus;
+        }
         if (!dxrDispatchLogged) {
             logFile << "[DXR] DispatchRays recorded for " << pipeline.getRenderWidth() << 'x'
                     << pipeline.getRenderHeight() << " render target." << std::endl;
             dxrDispatchLogged = true;
+        }
+
+        if (testMode && !reflectionCompareMode && (needCapture == 1 || needCapture == 9)) {
+            logFile << "[Noise Check] " << (needCapture == 1 ? "early" : "converged")
+                    << " path capture: accumulation=" << scene.getSceneCB().accumFrameCount
+                    << ", NRD requested=" << (scene.getSceneCB().enableNRD != 0 ? "yes" : "no")
+                    << ", NRD available=" << (pipeline.isNrdAvailable() ? "yes" : "no")
+                    << ", DXR reflections="
+                    << (scene.getSceneCB().enableRayTracedReflections > 0.5f ? "on" : "off") << ".\n";
         }
 
         if (reflectionCompareMode && needCapture >= 9 && needCapture <= 11) {
@@ -428,10 +550,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             imguiRenderer.copyBackBufferToReadback(device, window.getWidth(), window.getHeight());
         }
 
-        device.endFrame(editorUI.isVsyncEnabled());
+        if (!device.endFrame(editorUI.isVsyncEnabled())) {
+            logFile << "[D3D12 Error] Frame submission/presentation failed; stopping the render loop.\n";
+            exitCode = -1;
+            break;
+        }
 
         if (needCapture != 0 || oceanSequenceCaptureFrame != 0) {
-            device.waitForGpu();
+            if (!device.waitForGpu()) {
+                logFile << "[D3D12 Error] Capture fence wait failed; capture output is invalid and rendering will stop.\n";
+                exitCode = -1;
+                break;
+            }
             if (oceanSequenceCaptureFrame != 0) {
                 std::error_code directoryError;
                 const std::string sequenceDirectory = oceanGif30FpsMode
@@ -462,7 +592,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             else if (needCapture == 7) { filename = "captures/07_camera_motion_taa.bmp"; ok = pipeline.saveReadbackToBmp(device, filename, &captureError); }
             else if (needCapture == 8 && oceanTestMode) { filename = "captures/08_ocean_buoyancy.bmp"; ok = pipeline.saveReadbackToBmp(device, filename, &captureError); }
             else if (needCapture == 8) { filename = "captures/08_material_upload.bmp"; ok = pipeline.saveReadbackToBmp(device, filename, &captureError); }
-            else if (needCapture == 9) { filename = "captures/09_reflections_on.bmp"; ok = pipeline.saveReadbackToBmp(device, filename, &captureError); }
+            else if (needCapture == 9 && reflectionCompareMode) { filename = "captures/09_reflections_on.bmp"; ok = pipeline.saveReadbackToBmp(device, filename, &captureError); }
+            else if (needCapture == 9) { filename = "captures/09_pathtracing_converged.bmp"; ok = pipeline.saveReadbackToBmp(device, filename, &captureError); }
             else if (needCapture == 10) { filename = "captures/10_reflections_off.bmp"; ok = pipeline.saveReadbackToBmp(device, filename, &captureError); }
             else if (needCapture == 11) { filename = "captures/11_reflections_restored.bmp"; ok = pipeline.saveReadbackToBmp(device, filename, &captureError); }
 
@@ -501,10 +632,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    device.waitForGpu();
+    if (!device.waitForGpu()) {
+        logFile << "[D3D12 Error] Final GPU drain failed during shutdown.\n";
+        exitCode = -1;
+    }
     imguiRenderer.shutdown();
     device.shutdown();
 
     logFile << "[Engine] Shutdown complete." << std::endl;
-    return 0;
+    return exitCode;
 }

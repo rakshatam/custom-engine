@@ -2,6 +2,7 @@
 """Exercise the separate Jolt ocean scene and validate its ray-traced capture."""
 from __future__ import annotations
 import re
+import math
 import shutil
 import struct
 import subprocess
@@ -39,27 +40,35 @@ def compare_reflection_captures(with_reflections: bytes, without_reflections: by
     return total_delta / total_channels, changed_pixels / (width * height)
 
 
-def compare_water_reflection_captures(with_reflections: bytes, without_reflections: bytes) -> tuple[float, float, int]:
-    """Measure reflection changes only on pixels that were blue water with DXR disabled."""
+def compare_water_reflection_captures(
+    with_reflections: bytes, without_reflections: bytes, mask_reference: bytes | None = None,
+) -> tuple[float, float, int]:
+    """Measure DXR changes on a fixed low-reflectance blue-water mask."""
     width, signed_height = struct.unpack_from("<ii", without_reflections, 18)
     on_width, on_signed_height = struct.unpack_from("<ii", with_reflections, 18)
     height = abs(signed_height)
     if (width, signed_height) != (on_width, on_signed_height):
         raise ValueError("reflection captures have different dimensions or orientation")
+    if mask_reference is None:
+        mask_reference = without_reflections
+    mask_width, mask_signed_height = struct.unpack_from("<ii", mask_reference, 18)
+    if (width, signed_height) != (mask_width, mask_signed_height):
+        raise ValueError("water mask and reflection captures have different dimensions or orientation")
     offset = struct.unpack_from("<I", with_reflections, 10)[0]
     off_offset = struct.unpack_from("<I", without_reflections, 10)[0]
+    mask_offset = struct.unpack_from("<I", mask_reference, 10)[0]
     row_stride = ((width * 3 + 3) // 4) * 4
     total_delta = changed_pixels = water_pixels = 0
-    # The ocean test camera keeps the surface below the horizon. Classify the
-    # no-DXR image so reflected object colors in the enabled image cannot remove
-    # their pixels from the water mask.
+    # Use a separate 1x/no-DXR reference when comparing higher strengths. This
+    # prevents the reflectance control itself changing the blue-water mask.
     for y in range(height // 2, height):
         row = y if signed_height < 0 else height - 1 - y
         on_row = offset + row * row_stride
         off_row = off_offset + row * row_stride
+        mask_row = mask_offset + row * row_stride
         for x in range(width):
             pixel = x * 3
-            blue, green, red = without_reflections[off_row + pixel:off_row + pixel + 3]
+            blue, green, red = mask_reference[mask_row + pixel:mask_row + pixel + 3]
             if blue <= red * 1.2 or blue <= green * 0.95:
                 continue
             on_pixel = with_reflections[on_row + pixel:on_row + pixel + 3]
@@ -113,22 +122,32 @@ def compare_body_neighborhood_water(first_path: Path, second_path: Path) -> tupl
     height = abs(signed_height)
     if (width, signed_height) != (second_width, second_signed_height):
         raise ValueError("body-displacement captures have different dimensions or orientation")
-    if (width, height) != (688, 448):
-        raise ValueError(f"body-neighborhood test requires its calibrated 688x448 capture, got {width}x{height}")
+    if width <= 0 or height <= 0:
+        raise ValueError(f"body-neighborhood test requires positive capture dimensions, got {width}x{height}")
     first_offset, second_offset = struct.unpack_from("<I", first, 10)[0], struct.unpack_from("<I", second, 10)[0]
     row_stride = ((width * 3 + 3) // 4) * 4
-    # Fixed-camera centers for the six known Jolt props in this regression scene.
-    body_centers = ((231, 318), (314, 296), (377, 315), (429, 291), (464, 351), (339, 391))
-    neighborhood_radius_squared = 34 * 34
+    # Centers were calibrated in a 688x448 view. Scale by height to preserve
+    # the same vertical-FOV projection when testing at native 1920x1080; this
+    # maps horizontal offsets correctly if the aspect ratio changes.
+    reference_width, reference_height = 688.0, 448.0
+    pixel_scale = height / reference_height
+    body_centers = tuple(
+        (width * 0.5 + (x - reference_width * 0.5) * pixel_scale, y * pixel_scale)
+        for x, y in ((231, 318), (314, 296), (377, 315), (429, 291), (464, 351), (339, 391))
+    )
+    radius_x = max(1, round(34 * pixel_scale))
+    radius_y = max(1, round(34 * pixel_scale))
     total_delta = changed_pixels = sample_count = 0
-    for center_x, center_y in body_centers:
-        for y in range(max(height // 2, center_y - 34), min(height, center_y + 35)):
+    for center_x_float, center_y_float in body_centers:
+        center_x, center_y = round(center_x_float), round(center_y_float)
+        for y in range(max(height // 2, center_y - radius_y), min(height, center_y + radius_y + 1)):
             row = y if signed_height < 0 else height - 1 - y
             first_row = first_offset + row * row_stride
             second_row = second_offset + row * row_stride
-            for x in range(max(0, center_x - 34), min(width, center_x + 35)):
-                dx, dy = x - center_x, y - center_y
-                if dx * dx + dy * dy > neighborhood_radius_squared:
+            for x in range(max(0, center_x - radius_x), min(width, center_x + radius_x + 1)):
+                dx = (x - center_x) / radius_x
+                dy = (y - center_y) / radius_y
+                if dx * dx + dy * dy > 1.0:
                     continue
                 offset = x * 3
                 p = first[first_row + offset:first_row + offset + 3]
@@ -147,6 +166,21 @@ def compare_body_neighborhood_water(first_path: Path, second_path: Path) -> tupl
 
 def main() -> int:
     args = sys.argv[1:]
+    native_resolution = "--native-resolution" in args
+    args = [arg for arg in args if arg != "--native-resolution"]
+    reflection_strength = 2.5
+    for arg in args[:]:
+        if arg.startswith("--reflection-strength="):
+            try:
+                reflection_strength = float(arg.partition("=")[2])
+            except ValueError:
+                print("[Ocean Runner Error] Reflection strength must be numeric.", file=sys.stderr)
+                return 2
+            args.remove(arg)
+            break
+    if not math.isfinite(reflection_strength) or not 1.0 <= reflection_strength <= 4.0:
+        print("[Ocean Runner Error] Reflection strength must be finite and between 1.0 and 4.0.", file=sys.stderr)
+        return 2
     gif_30fps = "--gif-30fps" in args
     sequence_mode = "--sequence" in args or gif_30fps
     args = [arg for arg in args if arg not in {"--sequence", "--gif-30fps"}]
@@ -157,7 +191,7 @@ def main() -> int:
     args = [arg for arg in args if arg not in {
         "--no-reflections", "--compare-reflections", "--no-body-displacement", "--compare-body-displacement"}]
     if len(args) > 1:
-        print("usage: ocean_capture_runner.py [--no-reflections | --compare-reflections] [--no-body-displacement | --compare-body-displacement] [--sequence | --gif-30fps] [ENGINE.exe]", file=sys.stderr)
+        print("usage: ocean_capture_runner.py [--native-resolution] [--reflection-strength=1..4] [--no-reflections | --compare-reflections] [--no-body-displacement | --compare-body-displacement] [--sequence | --gif-30fps] [ENGINE.exe]", file=sys.stderr)
         return 2
     if no_reflections and compare_reflections:
         print("[Ocean Runner Error] Choose either --no-reflections or --compare-reflections.", file=sys.stderr)
@@ -186,12 +220,22 @@ def main() -> int:
         reflection_off_path = capture_dir / "ocean_reflections_off.bmp"
         reflection_restored_path = capture_dir / "ocean_reflections_restored.bmp"
 
-        def run_variant(disabled: bool) -> int:
-            child_args = [sys.executable, str(script)]
+        def run_variant(disabled: bool, strength: float | None = None) -> int:
+            selected_strength = reflection_strength if strength is None else strength
+            child_args = [sys.executable, str(script), f"--reflection-strength={selected_strength:g}"]
+            if native_resolution:
+                child_args.append("--native-resolution")
             if disabled:
                 child_args.append("--no-reflections")
             child_args.append(str(exe))
             return subprocess.run(child_args, cwd=ROOT, timeout=120, check=False).returncode
+
+        if run_variant(True, 1.0) != 0:
+            return 1
+        water_mask_reference = CAPTURE.read_bytes()
+        mask_path = capture_dir / "ocean_reflection_water_mask.bmp"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(CAPTURE, mask_path)
 
         if run_variant(False) != 0:
             return 1
@@ -206,7 +250,7 @@ def main() -> int:
         try:
             mean_delta, changed_ratio = compare_reflection_captures(with_reflections, without_reflections)
             water_mean_delta, water_changed_ratio, water_pixels = compare_water_reflection_captures(
-                with_reflections, without_reflections)
+                with_reflections, without_reflections, water_mask_reference)
         except ValueError as error:
             run_variant(False)
             print(f"[Ocean Runner Error] {error}", file=sys.stderr)
@@ -223,7 +267,8 @@ def main() -> int:
         if water_pixels < 1000 or water_mean_delta < 0.20 or water_changed_ratio < 0.005:
             print("[Ocean Runner Error] DXR reflection toggle did not produce a meaningful change on the water surface.", file=sys.stderr)
             return 1
-        if not (reflection_on_path.is_file() and reflection_off_path.is_file() and reflection_restored_path.is_file()):
+        if not (reflection_on_path.is_file() and reflection_off_path.is_file() and reflection_restored_path.is_file()
+                and mask_path.is_file()):
             print("[Ocean Runner Error] Water reflection on/off/restored evidence captures were not preserved.", file=sys.stderr)
             return 1
         return 0
@@ -231,7 +276,9 @@ def main() -> int:
         script = Path(__file__).resolve()
 
         def run_variant(disabled: bool) -> int:
-            child_args = [sys.executable, str(script)]
+            child_args = [sys.executable, str(script), f"--reflection-strength={reflection_strength:g}"]
+            if native_resolution:
+                child_args.append("--native-resolution")
             if disabled:
                 child_args.append("--no-body-displacement")
             child_args.append(str(exe))
@@ -264,7 +311,9 @@ def main() -> int:
             return 1
         return 0
     started = time.time_ns()
-    engine_args = [str(exe), "--ocean-test"]
+    engine_args = [str(exe), "--ocean-test", f"--ocean-reflection-strength={reflection_strength:g}"]
+    if native_resolution:
+        engine_args.append("--native-resolution")
     if gif_30fps:
         engine_args.append("--ocean-gif-30fps")
     elif sequence_mode:
@@ -374,6 +423,9 @@ def main() -> int:
         return 1
     width, signed_height = struct.unpack_from("<ii", data, 18)
     height = abs(signed_height)
+    if native_resolution and (width, height) != (1920, 1080):
+        print(f"[Ocean Runner Error] Native-resolution ocean run rendered at {width}x{height}, expected 1920x1080.", file=sys.stderr)
+        return 1
     pixel_offset = struct.unpack_from("<I", data, 10)[0]
     row_stride = ((width * 3 + 3) // 4) * 4
     if width <= 0 or height <= 0 or len(data) != pixel_offset + row_stride * height:

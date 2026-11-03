@@ -24,11 +24,13 @@ public:
                  DirectX::FXMMATRIX viewToClip,
                  DirectX::FXMMATRIX worldToView,
                  ID3D12Resource* signal,
+                 ID3D12Resource* specularSignal,
                  ID3D12Resource* normalRoughness,
                  ID3D12Resource* viewZ,
                  ID3D12Resource* motion,
-                 ID3D12Resource* denoisedOutput,
-                 bool outputIsShaderResource);
+                 ID3D12Resource* denoisedDiffuse,
+                 ID3D12Resource* denoisedSpecular,
+                 bool outputsAreShaderResources);
 
 private:
     struct State;

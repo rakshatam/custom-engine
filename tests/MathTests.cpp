@@ -4,6 +4,7 @@
 #include "OceanRayIntersectionReference.h"
 #include "../src/ecs/GltfImportMath.h"
 #include "../src/ecs/EntityIndex.h"
+#include "../src/editor/ImGuiProjectionMath.h"
 
 #include <algorithm>
 #include <cmath>
@@ -144,6 +145,25 @@ int main() {
     using Engine::AABB;
     using Engine::Vec3;
 
+    float uiProjection[4][4] = {};
+    check(Engine::makeUiProjection(10.0f, 20.0f, 100.0f, 50.0f, uiProjection) &&
+          std::abs(uiProjection[0][0] - 0.02f) < 1.0e-7f &&
+          std::abs(uiProjection[1][1] + 0.04f) < 1.0e-7f &&
+          std::abs(uiProjection[3][0] + 1.2f) < 1.0e-6f &&
+          std::abs(uiProjection[3][1] - 1.8f) < 1.0e-6f,
+          "UI projection maps a non-zero display origin into Direct3D clip space");
+    check(Engine::makeUiProjection(0.0f, 0.0f, 1920.0f, 1080.0f, uiProjection) &&
+          std::abs(uiProjection[3][0] + 1.0f) < 1.0e-7f &&
+          std::abs(uiProjection[3][1] - 1.0f) < 1.0e-7f &&
+          uiProjection[0][1] == 0.0f && uiProjection[1][0] == 0.0f,
+          "UI projection has the expected zero-origin scale and translation");
+    float unchangedProjection[4][4] = {};
+    unchangedProjection[0][0] = 7.0f;
+    check(!Engine::makeUiProjection(0.0f, 0.0f, 0.0f, 1080.0f, unchangedProjection) &&
+          !Engine::makeUiProjection(std::numeric_limits<float>::quiet_NaN(), 0.0f, 1920.0f, 1080.0f, unchangedProjection) &&
+          unchangedProjection[0][0] == 7.0f,
+          "UI projection rejects zero/non-finite inputs without partially overwriting output");
+
     check(ggxVndfEstimatorIdentityHolds(),
           "GGX VNDF reflected PDF and Cook-Torrance throughput reduce to F times G1(L)");
     check(complementaryHalfRateSequencesPreserveMean(),
@@ -174,14 +194,86 @@ int main() {
           "near-parallel ray outside a slab does not produce a false hit");
     check(!box.rayIntersect(Vec3(0.0f, 0.0f, 0.0f), Vec3(0.0f, 0.0f, 0.0f), hitDistance),
           "zero-length ray is rejected");
+    check(box.rayIntersect(Vec3(-100.0f, 0.0f, 0.0f), Vec3(1.0e-9f, 0.0f, 0.0f), hitDistance) &&
+          std::abs(hitDistance - 99.0f / 1.0e-9f) < 1.0e5f,
+          "small nonzero ray components remain valid over long distances");
+
+    AABB largeCoordinateBounds;
+    largeCoordinateBounds.expand(Vec3(2.0e30f, -2.0e30f, 3.0e30f));
+    largeCoordinateBounds.expand(Vec3(2.1e30f, -1.9e30f, 3.1e30f));
+    check(largeCoordinateBounds.min.x == 2.0e30f && largeCoordinateBounds.max.x == 2.1e30f &&
+          largeCoordinateBounds.min.y == -2.0e30f && largeCoordinateBounds.max.z == 3.1e30f,
+          "AABB bounds retain finite coordinates beyond the former 1e30 sentinel");
+
+    float triangleDistance = -7.0f;
+    check(Engine::rayTriangleIntersect(Vec3(0.25f, 0.25f, -1.0f), Vec3(0.0f, 0.0f, 1.0f),
+                                       Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f),
+                                       Vec3(0.0f, 1.0f, 0.0f), triangleDistance) &&
+          std::abs(triangleDistance - 1.0f) < 1.0e-5f,
+          "ray picking returns the forward hit distance for a two-sided triangle");
+    check(!Engine::rayTriangleIntersect(Vec3(1.0f, 1.0f, -1.0f), Vec3(0.0f, 0.0f, 1.0f),
+                                        Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f),
+                                        Vec3(0.0f, 1.0f, 0.0f), triangleDistance) && triangleDistance == 1.0f,
+          "ray picking rejects a bounding-box false positive without overwriting the previous hit distance");
+    check(!Engine::rayTriangleIntersect(Vec3(0.25f, 0.25f, 1.0f), Vec3(0.0f, 0.0f, 1.0f),
+                                        Vec3(0.0f, 0.0f, 0.0f), Vec3(1.0f, 0.0f, 0.0f),
+                                        Vec3(0.0f, 1.0f, 0.0f), triangleDistance),
+          "ray picking rejects triangles behind the ray origin");
 
     check(throwsDomainError([] { (void)(Vec3(1.0f, 2.0f, 3.0f) / 0.0f); }),
           "zero vector divisor fails explicitly");
     check(throwsDomainError([] {
         (void)Vec3(std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f).normalized();
     }), "non-finite vector normalization fails explicitly");
+    const Vec3 largeFiniteVector(1.0e38f, 1.0e38f, 1.0e38f);
+    const Vec3 largeFiniteUnit = largeFiniteVector.normalized();
+    check(std::isfinite(largeFiniteVector.length()) &&
+          std::abs(largeFiniteVector.length() / 1.7320508e38f - 1.0f) < 1.0e-5f &&
+          std::abs(largeFiniteUnit.length() - 1.0f) < 1.0e-5f,
+          "Vec3 hypot length and normalization remain finite when squared float components would overflow");
 
     Engine::CameraComponent camera;
+    camera.yaw = 90.0f;
+    camera.pitch = 0.0f;
+    const Vec3 cameraForward = camera.getForward();
+    const Vec3 cameraRight = camera.getRight();
+    const Vec3 cameraUp = camera.getUp();
+    check(std::abs(cameraForward.x) < 1.0e-5f && std::abs(cameraForward.z - 1.0f) < 1.0e-5f &&
+          std::abs(cameraRight.x - 1.0f) < 1.0e-5f && std::abs(cameraRight.z) < 1.0e-5f &&
+          std::abs(cameraUp.y - 1.0f) < 1.0e-5f,
+          "camera right/up basis agrees with DirectX left-handed view projection");
+    check(std::abs(Vec3::dot(cameraForward, cameraRight)) < 1.0e-5f &&
+          std::abs(Vec3::dot(cameraForward, cameraUp)) < 1.0e-5f &&
+          std::abs(Vec3::dot(cameraRight, cameraUp)) < 1.0e-5f &&
+          Vec3::dot(Vec3::cross(cameraRight, cameraUp), cameraForward) > 0.9999f,
+          "camera basis is orthonormal and right-handed");
+    constexpr float halfPi = 1.5707963267948966f;
+    const Engine::Mat4 helperYaw = Engine::Mat4::rotationYawPitchRoll(halfPi, 0.0f, 0.0f);
+    const Engine::Mat4 directYaw = Engine::Mat4::rotationY(halfPi);
+    const Engine::Mat4 helperPitch = Engine::Mat4::rotationYawPitchRoll(0.0f, halfPi, 0.0f);
+    const Engine::Mat4 directPitch = Engine::Mat4::rotationX(halfPi);
+    bool sameYawMatrix = true;
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            sameYawMatrix = sameYawMatrix &&
+                std::abs(helperYaw.m[row][column] - directYaw.m[row][column]) < 1.0e-5f &&
+                std::abs(helperPitch.m[row][column] - directPitch.m[row][column]) < 1.0e-5f;
+        }
+    }
+    const Engine::Mat4 columnTransform = Engine::Mat4::translation(Vec3(3.0f, -2.0f, 5.0f)) *
+        helperYaw * Engine::Mat4::scale(Vec3(2.0f, 3.0f, 4.0f));
+    const float point[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+    float transformedPoint[4] = {};
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            transformedPoint[row] += columnTransform.m[row][column] * point[column];
+        }
+    }
+    check(sameYawMatrix && std::abs(transformedPoint[0] - 3.0f) < 1.0e-5f &&
+          std::abs(transformedPoint[1] + 2.0f) < 1.0e-5f &&
+          std::abs(transformedPoint[2] - 3.0f) < 1.0e-5f &&
+          std::abs(transformedPoint[3] - 1.0f) < 1.0e-5f,
+          "Mat4 DirectX yaw conversion preserves column-vector rotation/scale/translation composition");
     camera.fov = std::numeric_limits<float>::quiet_NaN();
     camera.nearPlane = 0.0f;
     camera.farPlane = 0.0f;
@@ -426,14 +518,24 @@ int main() {
           std::abs(transformedNormal[1] - 0.8944272f) < 1.0e-5f,
           "glTF normals use normalized inverse-transpose under non-uniform scale");
     const float mirroredScale[16] = {-1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    const float forwardNormal[3] = {0.0f, 0.0f, 1.0f};
-    check(Engine::transformGltfNormal(mirroredScale, forwardNormal, transformedNormal) &&
-          std::abs(transformedNormal[2] - 1.0f) < 1.0e-6f,
-          "mirrored glTF node transform preserves inverse-transpose normal orientation");
-    const float singularMatrix[16] = {0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
-    check(!Engine::transformGltfNormal(singularMatrix, forwardNormal, transformedNormal),
-          "singular glTF node transform rejects undefined normal matrix");
-
+    const float mirroredSourceNormal[3] = {0.0f, 0.0f, 1.0f};
+    float mirroredNormal[3] = {};
+    double mirroredDeterminant = 0.0;
+    check(Engine::getGltfLinearDeterminant(mirroredScale, mirroredDeterminant) && mirroredDeterminant < 0.0 &&
+          Engine::transformGltfNormal(mirroredScale, mirroredSourceNormal, mirroredNormal) &&
+          mirroredNormal[2] > 0.9999f,
+          "mirrored glTF transforms preserve inverse-transpose normal orientation");
+    const float singularScale[16] = {1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    check(!Engine::getGltfLinearDeterminant(singularScale, mirroredDeterminant) &&
+          !Engine::transformGltfNormal(singularScale, mirroredSourceNormal, mirroredNormal),
+          "singular glTF node transforms are rejected before normal inversion");
+    const float sourceTangent[3] = {1.0f, -1.0f, 0.0f};
+    float transformedTangent[3] = {};
+    check(Engine::transformGltfPosition(nonUniformScale, sourceTangent, transformedTangent) &&
+          std::abs(transformedNormal[0] * transformedTangent[0] +
+                   transformedNormal[1] * transformedTangent[1] +
+                   transformedNormal[2] * transformedTangent[2]) < 1.0e-6f,
+          "inverse-transpose normal remains perpendicular to a non-uniformly transformed tangent");
     if (g_failures != 0) {
         std::cerr << "[MathTest] " << g_failures << " / " << g_checks << " check(s) failed.\n";
         return 1;
