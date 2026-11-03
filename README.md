@@ -24,7 +24,8 @@ These Sponza editor screenshots were supplied for the repository. Their FPS over
 
 
 
-![Sponza direct rendering with DXR reflections enabled at 1920x1080](docs/media/sponza-rt-reflections.png)
+<img width="1907" height="1007" alt="Screenshot 2026-11-03 183732" src="https://github.com/user-attachments/assets/c2834c67-0875-487f-8e6d-82c20216a1ab" />
+
 
 The ocean preview is assembled from a 60 Hz Jolt simulation at 30 frames per second. It shows entry, rebound, and water response. DXR uses a flat broad-phase water proxy; the closest-hit shader corrects the hit against the analytic height field.
 
